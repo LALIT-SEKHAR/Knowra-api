@@ -21,6 +21,9 @@ async function main() {
 
   const app = express();
 
+  // Render / reverse proxies set X-Forwarded-For; required for express-rate-limit
+  app.set('trust proxy', 1);
+
   app.use(helmet());
   app.use(
     cors({
