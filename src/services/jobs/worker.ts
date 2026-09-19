@@ -1,0 +1,224 @@
+import { Job, type JobType } from '../../models/Job.js';
+import { DocumentModel } from '../../models/Document.js';
+import { Chunk } from '../../models/Chunk.js';
+import { Conversation } from '../../models/Conversation.js';
+import { Message } from '../../models/Message.js';
+import { User } from '../../models/User.js';
+import { decryptSecret } from '../../utils/crypto.js';
+import {
+  deleteCloudinaryFile,
+  downloadCloudinaryFile,
+} from '../cloudinary/storage.js';
+import { chunkPages, extractPdfPages } from '../documents/parser.js';
+import { createEmbeddings } from '../openai/client.js';
+
+const WORKER_ID = `worker-${process.pid}`;
+const POLL_MS = 2000;
+
+export async function enqueueJob(
+  type: JobType,
+  payload: Record<string, unknown>,
+): Promise<void> {
+  await Job.create({
+    type,
+    payload,
+    status: 'pending',
+    attempts: 0,
+    nextRunAt: new Date(),
+  });
+}
+
+async function claimNextJob() {
+  const now = new Date();
+  return Job.findOneAndUpdate(
+    {
+      status: { $in: ['pending', 'failed'] },
+      nextRunAt: { $lte: now },
+      $expr: { $lt: ['$attempts', '$maxAttempts'] },
+    },
+    {
+      $set: {
+        status: 'processing',
+        lockedAt: now,
+        lockedBy: WORKER_ID,
+      },
+      $inc: { attempts: 1 },
+    },
+    { sort: { nextRunAt: 1 }, returnDocument: 'after' },
+  );
+}
+
+async function processDocumentJob(payload: { documentId: string; userId: string }) {
+  const document = await DocumentModel.findOne({
+    _id: payload.documentId,
+    userId: payload.userId,
+  });
+  if (!document) {
+    throw new Error('Document not found');
+  }
+
+  const user = await User.findById(payload.userId);
+  if (!user?.openaiApiKeyEncrypted) {
+    document.status = 'failed';
+    document.errorMessage = 'OpenAI API key is required in Settings before processing';
+    await document.save();
+    return;
+  }
+
+  document.status = 'processing';
+  document.errorMessage = undefined;
+  await document.save();
+
+  const buffer = await downloadCloudinaryFile(document.cloudinaryUrl);
+  let pages;
+  try {
+    pages = await extractPdfPages(buffer);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'PDF text extraction failed';
+    document.status = 'failed';
+    document.errorMessage = message;
+    await document.save();
+    return;
+  }
+
+  const textChunks = chunkPages(pages);
+
+  if (textChunks.length === 0) {
+    document.status = 'failed';
+    document.errorMessage =
+      'No extractable text found in this PDF. Scanned or image-only PDFs are not supported yet — upload a text-based PDF.';
+    await document.save();
+    return;
+  }
+
+  const apiKey = decryptSecret(user.openaiApiKeyEncrypted);
+  const embeddings = await createEmbeddings(
+    apiKey,
+    textChunks.map((c) => c.content),
+  );
+
+  await Chunk.deleteMany({ documentId: document._id });
+
+  const docs = textChunks.map((chunk, index) => ({
+    documentId: document._id,
+    userId: document.userId,
+    content: chunk.content,
+    embedding: embeddings[index],
+    pageNumber: chunk.pageNumber,
+    chunkIndex: chunk.chunkIndex,
+  }));
+
+  await Chunk.insertMany(docs);
+
+  document.status = 'ready';
+  document.pageCount = pages.length;
+  document.errorMessage = undefined;
+  await document.save();
+}
+
+async function deleteDocumentJob(payload: {
+  documentId: string;
+  userId: string;
+  cloudinaryPublicId?: string;
+}) {
+  const { documentId, userId, cloudinaryPublicId } = payload;
+
+  if (cloudinaryPublicId) {
+    try {
+      await deleteCloudinaryFile(cloudinaryPublicId);
+    } catch (err) {
+      console.error('Cloudinary delete failed, will retry', err);
+      throw err;
+    }
+  }
+
+  await Chunk.deleteMany({ documentId, userId });
+
+  const conversations = await Conversation.find({ documentId, userId }).select('_id');
+  const conversationIds = conversations.map((c) => c._id);
+  if (conversationIds.length > 0) {
+    await Message.deleteMany({ conversationId: { $in: conversationIds } });
+    await Conversation.deleteMany({ _id: { $in: conversationIds } });
+  }
+
+  await DocumentModel.deleteOne({ _id: documentId, userId });
+}
+
+async function handleJob(job: Awaited<ReturnType<typeof claimNextJob>>) {
+  if (!job) return;
+
+  try {
+    if (job.type === 'process_document') {
+      await processDocumentJob(job.payload as { documentId: string; userId: string });
+    } else if (job.type === 'delete_document') {
+      await deleteDocumentJob(
+        job.payload as {
+          documentId: string;
+          userId: string;
+          cloudinaryPublicId?: string;
+        },
+      );
+    }
+
+    job.status = 'completed';
+    job.lastError = undefined;
+    await job.save();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Unknown job error';
+    job.lastError = message;
+    const attempts = job.attempts ?? 1;
+    const maxAttempts = job.maxAttempts ?? 5;
+
+    if (attempts >= maxAttempts) {
+      job.status = 'failed';
+      if (job.type === 'process_document') {
+        const payload = job.payload as { documentId?: string };
+        if (payload.documentId) {
+          await DocumentModel.findByIdAndUpdate(payload.documentId, {
+            status: 'failed',
+            errorMessage: message,
+          });
+        }
+      }
+    } else {
+      job.status = 'pending';
+      const backoffMs = Math.min(60_000, 2 ** attempts * 1000);
+      job.nextRunAt = new Date(Date.now() + backoffMs);
+    }
+    await job.save();
+  }
+}
+
+let timer: NodeJS.Timeout | null = null;
+let running = false;
+
+async function tick() {
+  if (running) return;
+  running = true;
+  try {
+    const job = await claimNextJob();
+    if (job) {
+      await handleJob(job);
+    }
+  } catch (err) {
+    console.error('Job worker tick failed', err);
+  } finally {
+    running = false;
+  }
+}
+
+export function startJobWorker(): void {
+  if (timer) return;
+  console.log('Job worker started');
+  timer = setInterval(() => {
+    void tick();
+  }, POLL_MS);
+  void tick();
+}
+
+export function stopJobWorker(): void {
+  if (timer) {
+    clearInterval(timer);
+    timer = null;
+  }
+}

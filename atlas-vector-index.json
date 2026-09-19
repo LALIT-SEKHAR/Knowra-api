@@ -1,0 +1,22 @@
+{
+  "name": "chunk_embedding_index",
+  "type": "vectorSearch",
+  "definition": {
+    "fields": [
+      {
+        "type": "vector",
+        "path": "embedding",
+        "numDimensions": 1536,
+        "similarity": "cosine"
+      },
+      {
+        "type": "filter",
+        "path": "userId"
+      },
+      {
+        "type": "filter",
+        "path": "documentId"
+      }
+    ]
+  }
+}
