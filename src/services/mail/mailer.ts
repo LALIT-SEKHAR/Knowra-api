@@ -1,5 +1,6 @@
 import nodemailer, { type Transporter } from 'nodemailer';
 import { env } from '../../config/env.js';
+import { AppError } from '../../utils/errors.js';
 
 let transporter: Transporter | null = null;
 
@@ -13,17 +14,22 @@ function getTransporter(): Transporter {
     return transporter;
   }
 
+  // `family: 4` forces IPv4 — required on Render where Gmail IPv6 is unreachable.
   transporter = nodemailer.createTransport({
     host: env.SMTP_HOST,
     port: env.SMTP_PORT,
     secure: env.SMTP_PORT === 465,
+    family: 4,
+    connectionTimeout: 15_000,
+    greetingTimeout: 15_000,
+    socketTimeout: 20_000,
     auth: env.SMTP_USER
       ? {
           user: env.SMTP_USER,
           pass: env.SMTP_PASS,
         }
       : undefined,
-  });
+  } as Parameters<typeof nodemailer.createTransport>[0]);
 
   return transporter;
 }
@@ -127,23 +133,31 @@ function buildOtpEmailHtml(code: string, expiresMinutes: number): string {
 
 export async function sendOtpEmail(email: string, code: string): Promise<void> {
   const expiresMinutes = env.OTP_EXPIRY_MINUTES;
-  const info = await getTransporter().sendMail({
-    from: env.SMTP_FROM,
-    to: email,
-    subject: `${code} is your Knowra sign-in code`,
-    text: [
-      'Knowra — Ask. Explore. Understand.',
-      '',
-      `Your sign-in code is ${code}.`,
-      `It expires in ${expiresMinutes} minutes.`,
-      '',
-      'If you didn’t request this code, you can ignore this email.',
-    ].join('\n'),
-    html: buildOtpEmailHtml(code, expiresMinutes),
-  });
+  try {
+    const info = await getTransporter().sendMail({
+      from: env.SMTP_FROM,
+      to: email,
+      subject: `${code} is your Knowra sign-in code`,
+      text: [
+        'Knowra — Ask. Explore. Understand.',
+        '',
+        `Your sign-in code is ${code}.`,
+        `It expires in ${expiresMinutes} minutes.`,
+        '',
+        'If you didn’t request this code, you can ignore this email.',
+      ].join('\n'),
+      html: buildOtpEmailHtml(code, expiresMinutes),
+    });
 
-  if (!env.SMTP_HOST && env.NODE_ENV === 'development') {
-    console.log('[dev] OTP email (no SMTP configured):', info.message?.toString?.() ?? info);
-    console.log(`[dev] OTP for ${email}: ${code}`);
+    if (!env.SMTP_HOST && env.NODE_ENV === 'development') {
+      console.log('[dev] OTP email (no SMTP configured):', info.message?.toString?.() ?? info);
+      console.log(`[dev] OTP for ${email}: ${code}`);
+    }
+  } catch (err) {
+    console.error('Failed to send OTP email', err);
+    throw new AppError(
+      'Could not send verification email. Please try again in a moment.',
+      502,
+    );
   }
 }

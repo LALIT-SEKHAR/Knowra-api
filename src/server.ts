@@ -3,6 +3,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import mongoose from 'mongoose';
 import { ZodError } from 'zod';
+import dns from 'node:dns';
 import { env } from './config/env.js';
 import { connectDatabase } from './config/db.js';
 import { configureCloudinary } from './services/cloudinary/storage.js';
@@ -10,6 +11,9 @@ import { startJobWorker } from './services/jobs/worker.js';
 import { ensureChunkVectorIndex } from './services/rag/ensureVectorIndex.js';
 import { AppError, errorHandler } from './utils/errors.js';
 import routes from './routes/index.js';
+
+// Prefer IPv4 (Render free tier often cannot reach external SMTP over IPv6)
+dns.setDefaultResultOrder('ipv4first');
 
 async function main() {
   await connectDatabase();
