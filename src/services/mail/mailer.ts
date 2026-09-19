@@ -14,7 +14,7 @@ function getTransporter(): Transporter {
     return transporter;
   }
 
-  // `family: 4` forces IPv4 — required on Render where Gmail IPv6 is unreachable.
+  // `family: 4` forces IPv4 when SMTP is allowed (local / paid hosts).
   transporter = nodemailer.createTransport({
     host: env.SMTP_HOST,
     port: env.SMTP_PORT,
@@ -54,7 +54,6 @@ function buildOtpEmailHtml(code: string, expiresMinutes: number): string {
   <title>Knowra sign-in code</title>
 </head>
 <body style="margin:0;padding:0;background:#0a0a0a;font-family:'DM Sans',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
-  <!-- Preheader -->
   <div style="display:none;max-height:0;overflow:hidden;mso-hide:all;">
     Your Knowra sign-in code is ${code}. Expires in ${expiresMinutes} minutes.
   </div>
@@ -63,7 +62,6 @@ function buildOtpEmailHtml(code: string, expiresMinutes: number): string {
     <tr>
       <td align="center">
         <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:480px;background:#141414;border:1px solid rgba(255,255,255,0.12);border-radius:22px;overflow:hidden;">
-          <!-- Brand header -->
           <tr>
             <td style="padding:28px 32px 20px;border-bottom:1px solid rgba(255,255,255,0.10);">
               <table role="presentation" cellpadding="0" cellspacing="0" border="0">
@@ -80,8 +78,6 @@ function buildOtpEmailHtml(code: string, expiresMinutes: number): string {
               </table>
             </td>
           </tr>
-
-          <!-- Body -->
           <tr>
             <td style="padding:32px;">
               <h1 style="margin:0 0 10px;font-size:22px;font-weight:600;color:#f5f5f5;line-height:1.3;letter-spacing:-0.01em;">Your sign-in code</h1>
@@ -89,22 +85,17 @@ function buildOtpEmailHtml(code: string, expiresMinutes: number): string {
                 Use this one-time code to sign in to Knowra. It expires in
                 <strong style="color:#f5f5f5;">${expiresMinutes} minutes</strong>.
               </p>
-
-              <!-- Digit cards -->
               <table role="presentation" cellpadding="0" cellspacing="0" border="0" align="center" style="margin:0 auto 20px;">
                 <tr>
                   ${digitRow}
                 </tr>
               </table>
-
               <p style="margin:0 0 8px;font-size:12px;line-height:1.5;color:#737373;text-align:center;text-transform:uppercase;letter-spacing:0.08em;">
                 Or copy the full code
               </p>
               <p style="margin:0 0 28px;text-align:center;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:28px;font-weight:700;letter-spacing:0.35em;color:#f5f5f5;">
                 ${code}
               </p>
-
-              <!-- Notice -->
               <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#1a1a1a;border:1px solid rgba(255,255,255,0.10);border-radius:14px;">
                 <tr>
                   <td style="padding:14px 16px;font-size:13px;line-height:1.55;color:#a3a3a3;">
@@ -114,8 +105,6 @@ function buildOtpEmailHtml(code: string, expiresMinutes: number): string {
               </table>
             </td>
           </tr>
-
-          <!-- Footer -->
           <tr>
             <td style="padding:0 32px 28px;">
               <p style="margin:0;padding-top:20px;border-top:1px solid rgba(255,255,255,0.10);font-size:12px;line-height:1.5;color:#737373;text-align:center;">
@@ -131,28 +120,65 @@ function buildOtpEmailHtml(code: string, expiresMinutes: number): string {
 </html>`;
 }
 
-export async function sendOtpEmail(email: string, code: string): Promise<void> {
-  const expiresMinutes = env.OTP_EXPIRY_MINUTES;
-  try {
-    const info = await getTransporter().sendMail({
-      from: env.SMTP_FROM,
-      to: email,
-      subject: `${code} is your Knowra sign-in code`,
-      text: [
-        'Knowra — Ask. Explore. Understand.',
-        '',
-        `Your sign-in code is ${code}.`,
-        `It expires in ${expiresMinutes} minutes.`,
-        '',
-        'If you didn’t request this code, you can ignore this email.',
-      ].join('\n'),
-      html: buildOtpEmailHtml(code, expiresMinutes),
-    });
+function buildOtpText(code: string, expiresMinutes: number): string {
+  return [
+    'Knowra — Ask. Explore. Understand.',
+    '',
+    `Your sign-in code is ${code}.`,
+    `It expires in ${expiresMinutes} minutes.`,
+    '',
+    'If you didn’t request this code, you can ignore this email.',
+  ].join('\n');
+}
 
-    if (!env.SMTP_HOST && env.NODE_ENV === 'development') {
-      console.log('[dev] OTP email (no SMTP configured):', info.message?.toString?.() ?? info);
-      console.log(`[dev] OTP for ${email}: ${code}`);
+/** HTTPS email API — works on Render free (SMTP ports are blocked). */
+async function sendViaResend(email: string, code: string): Promise<void> {
+  const expiresMinutes = env.OTP_EXPIRY_MINUTES;
+  const response = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${env.RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: env.SMTP_FROM,
+      to: [email],
+      subject: `${code} is your Knowra sign-in code`,
+      html: buildOtpEmailHtml(code, expiresMinutes),
+      text: buildOtpText(code, expiresMinutes),
+    }),
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    console.error('Resend API error', response.status, body);
+    throw new Error(`Resend failed: ${response.status}`);
+  }
+}
+
+async function sendViaSmtp(email: string, code: string): Promise<void> {
+  const expiresMinutes = env.OTP_EXPIRY_MINUTES;
+  const info = await getTransporter().sendMail({
+    from: env.SMTP_FROM,
+    to: email,
+    subject: `${code} is your Knowra sign-in code`,
+    text: buildOtpText(code, expiresMinutes),
+    html: buildOtpEmailHtml(code, expiresMinutes),
+  });
+
+  if (!env.SMTP_HOST && env.NODE_ENV === 'development') {
+    console.log('[dev] OTP email (no SMTP configured):', info.message?.toString?.() ?? info);
+    console.log(`[dev] OTP for ${email}: ${code}`);
+  }
+}
+
+export async function sendOtpEmail(email: string, code: string): Promise<void> {
+  try {
+    if (env.RESEND_API_KEY) {
+      await sendViaResend(email, code);
+      return;
     }
+    await sendViaSmtp(email, code);
   } catch (err) {
     console.error('Failed to send OTP email', err);
     throw new AppError(

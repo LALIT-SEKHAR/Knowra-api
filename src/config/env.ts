@@ -19,6 +19,7 @@ const envSchema = z.object({
   SMTP_USER: z.string().optional().default(''),
   SMTP_PASS: z.string().optional().default(''),
   SMTP_FROM: z.string().default('Knowra <noreply@knowra.app>'),
+  RESEND_API_KEY: z.string().optional().default(''),
   OTP_EXPIRY_MINUTES: z.coerce.number().default(10),
   MAX_UPLOAD_BYTES: z.coerce.number().default(20 * 1024 * 1024),
   VECTOR_INDEX_NAME: z.string().default('chunk_embedding_index'),
