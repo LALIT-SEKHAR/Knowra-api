@@ -49,8 +49,8 @@ async function main() {
 
   startJobWorker();
 
-  app.listen(env.PORT, () => {
-    console.log(`Knowra API listening on http://localhost:${env.PORT}`);
+  app.listen(env.PORT, '0.0.0.0', () => {
+    console.log(`Knowra API listening on http://0.0.0.0:${env.PORT}`);
   });
 }
 
