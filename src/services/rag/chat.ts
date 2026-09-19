@@ -124,24 +124,65 @@ async function attachDocumentNames(chunks: RetrievedChunk[]): Promise<RetrievedC
   }));
 }
 
+function isCasualMessage(text: string): boolean {
+  const normalized = text.trim().toLowerCase().replace(/[!?.]+$/g, '');
+  if (!normalized || normalized.length > 80) return false;
+  const casual = [
+    'hi',
+    'hello',
+    'hey',
+    'hiya',
+    'howdy',
+    'yo',
+    'sup',
+    'good morning',
+    'good afternoon',
+    'good evening',
+    'thanks',
+    'thank you',
+    'thx',
+    'ty',
+    'ok',
+    'okay',
+    'cool',
+    'great',
+    'nice',
+    'bye',
+    'goodbye',
+    'see you',
+    'what can you do',
+    'who are you',
+    'help',
+  ];
+  return casual.some((phrase) => normalized === phrase || normalized.startsWith(`${phrase} `));
+}
+
 function buildSystemPrompt(scope: 'library' | 'document'): string {
+  const shared = [
+    'You are Knowra, a friendly AI assistant that helps users explore their uploaded documents.',
+    'For greetings, thanks, or small talk, reply briefly and warmly. Offer to help with their documents.',
+    'For questions about your capabilities, explain that you can search and answer from their uploaded PDFs.',
+    'For document questions, use ONLY the provided document context. Do not invent page numbers, document names, or facts.',
+    'If a document question cannot be answered from the context, say you cannot find that information in the uploaded documents.',
+    'Be clear and concise.',
+  ];
+
   if (scope === 'library') {
     return [
-      'You are Knowra, an AI assistant that helps users explore their uploaded documents.',
-      'Answer using ONLY the provided document context from the user library.',
+      ...shared,
       'When context comes from multiple documents, mention which document supports each claim when helpful.',
-      'If the context is insufficient, say you cannot find that information in the uploaded documents.',
-      'Do not invent page numbers, document names, or facts.',
-      'Be clear and concise.',
     ].join(' ');
   }
 
+  return shared.join(' ');
+}
+
+function buildCasualSystemPrompt(): string {
   return [
-    'You are Knowra, an AI assistant that helps users explore documents.',
-    'Answer using ONLY the provided document context.',
-    'If the context is insufficient, say you cannot find that information in the document.',
-    'Do not invent page numbers or facts.',
-    'Be clear and concise.',
+    'You are Knowra, a friendly AI assistant for exploring uploaded PDF documents.',
+    'Reply briefly and warmly to greetings and small talk.',
+    "If asked what you can do, say you can answer questions using the user's uploaded documents.",
+    'Do not invent document contents. Keep replies short.',
   ].join(' ');
 }
 
@@ -174,42 +215,48 @@ async function runChat(params: {
   conversationId: string;
 }> {
   const apiKey = await requireApiKey(params.userId);
+  const casual = isCasualMessage(params.question);
 
   let documentIds: mongoose.Types.ObjectId[] | null = null;
   let scope: 'library' | 'document' = 'library';
 
-  if (params.documentId) {
-    const document = await DocumentModel.findOne({
-      _id: params.documentId,
-      userId: params.userId,
-    });
-    if (!document) {
-      throw new AppError('Document not found', 404);
+  if (!casual) {
+    if (params.documentId) {
+      const document = await DocumentModel.findOne({
+        _id: params.documentId,
+        userId: params.userId,
+      });
+      if (!document) {
+        throw new AppError('Document not found', 404);
+      }
+      if (document.status !== 'ready') {
+        throw new AppError('Document is not ready for chat', 400);
+      }
+      documentIds = [document._id];
+      scope = 'document';
+    } else {
+      const readyIds = await getReadyDocumentIds(params.userId);
+      if (readyIds.length === 0) {
+        throw new AppError('Upload and process at least one PDF before chatting.', 400);
+      }
+      // Library mode: search all of this user's chunks (userId filter only)
+      documentIds = null;
     }
-    if (document.status !== 'ready') {
-      throw new AppError('Document is not ready for chat', 400);
+
+    const chunkFilter = documentIds
+      ? { userId: params.userId, documentId: documentIds[0] }
+      : { userId: params.userId };
+
+    const chunkCount = await Chunk.countDocuments(chunkFilter);
+    if (chunkCount === 0) {
+      throw new AppError(
+        'No indexed document content yet. Wait for processing to finish, or retry from Files.',
+        400,
+      );
     }
-    documentIds = [document._id];
+  } else if (params.documentId) {
+    documentIds = [new mongoose.Types.ObjectId(params.documentId)];
     scope = 'document';
-  } else {
-    const readyIds = await getReadyDocumentIds(params.userId);
-    if (readyIds.length === 0) {
-      throw new AppError('Upload and process at least one PDF before chatting.', 400);
-    }
-    // Library mode: search all of this user's chunks (userId filter only)
-    documentIds = null;
-  }
-
-  const chunkFilter = documentIds
-    ? { userId: params.userId, documentId: documentIds[0] }
-    : { userId: params.userId };
-
-  const chunkCount = await Chunk.countDocuments(chunkFilter);
-  if (chunkCount === 0) {
-    throw new AppError(
-      'No indexed document content yet. Wait for processing to finish, or retry from Files.',
-      400,
-    );
   }
 
   let conversation = params.conversationId
@@ -231,6 +278,43 @@ async function runChat(params: {
     .sort({ createdAt: 1 })
     .limit(20);
 
+  const recentHistory = history.slice(-8).map((m) => ({
+    role: m.role as 'user' | 'assistant' | 'system',
+    content: m.content,
+  }));
+
+  // Greetings / small talk should not force document retrieval.
+  if (casual) {
+    const answer = await generateChatAnswer(apiKey, {
+      system: buildCasualSystemPrompt(),
+      messages: [...recentHistory, { role: 'user', content: params.question }],
+    });
+
+    await Message.create({
+      conversationId: conversation._id,
+      role: 'user',
+      content: params.question,
+    });
+    await Message.create({
+      conversationId: conversation._id,
+      role: 'assistant',
+      content: answer,
+      sources: [],
+    });
+
+    conversation.updatedAt = new Date();
+    if (!conversation.title) {
+      conversation.title = params.question.slice(0, 80);
+    }
+    await conversation.save();
+
+    return {
+      answer,
+      sources: [],
+      conversationId: conversation._id.toString(),
+    };
+  }
+
   const queryEmbedding = await createEmbedding(apiKey, params.question);
   const retrievedRaw = await vectorSearch(
     params.userId,
@@ -247,10 +331,6 @@ async function runChat(params: {
   }
 
   const context = buildContextBlock(retrieved);
-  const recentHistory = history.slice(-8).map((m) => ({
-    role: m.role as 'user' | 'assistant' | 'system',
-    content: m.content,
-  }));
 
   const answer = await generateChatAnswer(apiKey, {
     system: buildSystemPrompt(scope),
