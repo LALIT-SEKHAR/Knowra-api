@@ -4,6 +4,8 @@ const userSchema = new Schema(
   {
     email: { type: String, required: true, unique: true, lowercase: true, trim: true },
     name: { type: String, trim: true },
+    avatarUrl: { type: String },
+    avatarPublicId: { type: String },
     openaiApiKeyEncrypted: { type: String },
     openaiKeyLast4: { type: String },
     lastLoginAt: { type: Date },

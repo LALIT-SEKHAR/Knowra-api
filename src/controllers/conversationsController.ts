@@ -1,8 +1,29 @@
+import { z } from 'zod';
 import type { Response } from 'express';
 import { asyncHandler, AppError } from '../utils/errors.js';
 import type { AuthedRequest } from '../middleware/auth.js';
 import { Conversation } from '../models/Conversation.js';
 import { Message } from '../models/Message.js';
+import { chatAcrossLibrary } from '../services/rag/chat.js';
+
+function serializeSources(
+  sources:
+    | {
+        documentId?: { toString(): string } | string;
+        documentName?: string;
+        chunkId?: { toString(): string } | string;
+        pageNumber?: number;
+      }[]
+    | undefined,
+) {
+  if (!sources?.length) return [];
+  return sources.map((s) => ({
+    documentId: s.documentId?.toString?.() ?? String(s.documentId ?? ''),
+    documentName: s.documentName,
+    chunkId: s.chunkId?.toString?.() ?? String(s.chunkId ?? ''),
+    pageNumber: s.pageNumber,
+  }));
+}
 
 export const listConversationsHandler = asyncHandler(
   async (req: AuthedRequest, res: Response) => {
@@ -44,10 +65,28 @@ export const getConversationHandler = asyncHandler(async (req: AuthedRequest, re
       id: m._id.toString(),
       role: m.role,
       content: m.content,
-      sources: m.sources ?? [],
+      sources: serializeSources(m.sources as never),
       createdAt: m.createdAt,
     })),
   });
+});
+
+const chatSchema = z.object({
+  question: z.string().min(1).max(4000),
+  conversationId: z.string().optional(),
+  /** Optional: scope retrieval to one document. Omit to search all ready docs. */
+  documentId: z.string().optional(),
+});
+
+export const chatHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
+  const body = chatSchema.parse(req.body);
+  const result = await chatAcrossLibrary({
+    userId: req.user!._id.toString(),
+    question: body.question,
+    conversationId: body.conversationId,
+    documentId: body.documentId,
+  });
+  res.json(result);
 });
 
 export const deleteConversationHandler = asyncHandler(

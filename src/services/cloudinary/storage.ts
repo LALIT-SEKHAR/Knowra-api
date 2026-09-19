@@ -67,6 +67,55 @@ export async function deleteCloudinaryFile(publicId: string): Promise<void> {
   await cloudinary.uploader.destroy(publicId, { resource_type: 'raw' });
 }
 
+const ALLOWED_AVATAR_MIME = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
+
+export function isAllowedAvatarMime(mime: string): boolean {
+  return ALLOWED_AVATAR_MIME.has(mime);
+}
+
+export async function uploadAvatarBuffer(
+  buffer: Buffer,
+  filename: string,
+  userId: string,
+): Promise<{ publicId: string; url: string; bytes: number }> {
+  assertConfigured();
+
+  const safeBase = filename
+    .replace(/\.[^.]+$/, '')
+    .replace(/[^a-zA-Z0-9._-]+/g, '_')
+    .slice(0, 60);
+  const publicId = `avatar_${safeBase}_${Date.now()}`;
+
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      {
+        resource_type: 'image',
+        folder: `knowra/${userId}/avatars`,
+        public_id: publicId,
+        overwrite: true,
+        transformation: [{ width: 256, height: 256, crop: 'fill', gravity: 'face' }],
+      },
+      (error, result) => {
+        if (error || !result) {
+          reject(error ?? new Error('Cloudinary avatar upload failed'));
+          return;
+        }
+        resolve({
+          publicId: result.public_id,
+          url: result.secure_url,
+          bytes: result.bytes,
+        });
+      },
+    );
+    stream.end(buffer);
+  });
+}
+
+export async function deleteCloudinaryImage(publicId: string): Promise<void> {
+  assertConfigured();
+  await cloudinary.uploader.destroy(publicId, { resource_type: 'image' });
+}
+
 export async function downloadCloudinaryFile(url: string): Promise<Buffer> {
   const response = await fetch(url);
   if (!response.ok) {

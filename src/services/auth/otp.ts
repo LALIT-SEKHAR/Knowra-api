@@ -23,7 +23,10 @@ export async function requestOtp(email: string): Promise<void> {
 export async function verifyOtp(
   email: string,
   code: string,
-): Promise<{ token: string; user: { id: string; email: string; name?: string | null } }> {
+): Promise<{
+  token: string;
+  user: { id: string; email: string; name?: string | null; avatarUrl?: string | null };
+}> {
   const normalized = email.trim().toLowerCase();
   const normalizedCode = code.replace(/\s+/g, '');
   const otp = await Otp.findOne({ email: normalized, consumed: false }).sort({ createdAt: -1 });
@@ -64,7 +67,8 @@ export async function verifyOtp(
     user: {
       id: user._id.toString(),
       email: user.email,
-      name: user.name,
+      name: user.name ?? null,
+      avatarUrl: user.avatarUrl ?? null,
     },
   };
 }

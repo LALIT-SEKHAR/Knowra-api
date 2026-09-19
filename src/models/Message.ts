@@ -3,6 +3,7 @@ import mongoose, { Schema, type InferSchemaType, type Model } from 'mongoose';
 const sourceSchema = new Schema(
   {
     documentId: { type: Schema.Types.ObjectId, required: true },
+    documentName: { type: String },
     chunkId: { type: Schema.Types.ObjectId, required: true },
     pageNumber: { type: Number },
   },
