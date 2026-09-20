@@ -1,8 +1,13 @@
+import { existsSync, readFileSync } from 'node:fs';
+import path from 'node:path';
 import nodemailer, { type Transporter } from 'nodemailer';
 import { env } from '../../config/env.js';
 import { AppError } from '../../utils/errors.js';
 
+const LOGO_CID = 'knowra-logo';
+
 let transporter: Transporter | null = null;
+let cachedLogo: { path: string; content: Buffer } | null | undefined;
 
 function getTransporter(): Transporter {
   if (transporter) return transporter;
@@ -34,6 +39,30 @@ function getTransporter(): Transporter {
   return transporter;
 }
 
+function getPublicLogoUrl(): string {
+  const origin = env.CLIENT_ORIGIN.split(',')[0]?.trim().replace(/\/$/, '') ?? '';
+  return origin ? `${origin}/logo.png` : '';
+}
+
+function getLogoFile(): { path: string; content: Buffer } | null {
+  if (cachedLogo !== undefined) return cachedLogo;
+
+  const candidates = [
+    path.join(process.cwd(), 'assets', 'logo.png'),
+    path.join(process.cwd(), 'logo.png'),
+  ];
+
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) {
+      cachedLogo = { path: candidate, content: readFileSync(candidate) };
+      return cachedLogo;
+    }
+  }
+
+  cachedLogo = null;
+  return null;
+}
+
 function buildOtpEmailHtml(code: string, expiresMinutes: number): string {
   const digits = code.split('').map(
     (d) =>
@@ -43,6 +72,15 @@ function buildOtpEmailHtml(code: string, expiresMinutes: number): string {
   const digitRow = digits.join(
     '<td style="width:8px;font-size:0;line-height:0;">&nbsp;</td>',
   );
+
+  const publicLogo = getPublicLogoUrl();
+  const hasFileLogo = Boolean(getLogoFile());
+  // Prefer hosted logo URL (works in most clients); CID when no public app origin.
+  const logoSrc = publicLogo || (hasFileLogo ? `cid:${LOGO_CID}` : '');
+
+  const logoCell = logoSrc
+    ? `<img src="${logoSrc}" alt="Knowra" width="40" height="40" style="display:block;width:40px;height:40px;border-radius:10px;border:0;" />`
+    : `<span style="display:inline-block;width:40px;height:40px;background:#f5f0e8;border-radius:10px;text-align:center;font-family:Georgia,'Times New Roman',serif;font-size:18px;font-weight:700;color:#0a0a0a;line-height:40px;">K</span>`;
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -66,8 +104,8 @@ function buildOtpEmailHtml(code: string, expiresMinutes: number): string {
             <td style="padding:28px 32px 20px;border-bottom:1px solid rgba(255,255,255,0.10);">
               <table role="presentation" cellpadding="0" cellspacing="0" border="0">
                 <tr>
-                  <td style="width:36px;height:36px;background:#f5f5f5;border-radius:10px;text-align:center;vertical-align:middle;">
-                    <span style="font-family:Georgia,'Times New Roman',serif;font-size:18px;font-weight:700;color:#0a0a0a;line-height:36px;">K</span>
+                  <td style="vertical-align:middle;">
+                    ${logoCell}
                   </td>
                   <td style="width:12px;font-size:0;">&nbsp;</td>
                   <td style="vertical-align:middle;">
@@ -131,39 +169,67 @@ function buildOtpText(code: string, expiresMinutes: number): string {
   ].join('\n');
 }
 
+function logoAttachment() {
+  const logo = getLogoFile();
+  if (!logo) return null;
+  return {
+    filename: 'logo.png',
+    content: logo.content,
+    contentType: 'image/png',
+    cid: LOGO_CID,
+    contentDisposition: 'inline' as const,
+  };
+}
+
 /** HTTPS email API — works on Render free (SMTP ports are blocked). */
 async function sendViaResend(email: string, code: string): Promise<void> {
   const expiresMinutes = env.OTP_EXPIRY_MINUTES;
+  const logo = getLogoFile();
+  const body: Record<string, unknown> = {
+    from: env.SMTP_FROM,
+    to: [email],
+    subject: `${code} is your Knowra sign-in code`,
+    html: buildOtpEmailHtml(code, expiresMinutes),
+    text: buildOtpText(code, expiresMinutes),
+  };
+
+  if (logo) {
+    body.attachments = [
+      {
+        filename: 'logo.png',
+        content: logo.content.toString('base64'),
+        content_id: LOGO_CID,
+        content_type: 'image/png',
+      },
+    ];
+  }
+
   const response = await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${env.RESEND_API_KEY}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({
-      from: env.SMTP_FROM,
-      to: [email],
-      subject: `${code} is your Knowra sign-in code`,
-      html: buildOtpEmailHtml(code, expiresMinutes),
-      text: buildOtpText(code, expiresMinutes),
-    }),
+    body: JSON.stringify(body),
   });
 
   if (!response.ok) {
-    const body = await response.text();
-    console.error('Resend API error', response.status, body);
+    const errBody = await response.text();
+    console.error('Resend API error', response.status, errBody);
     throw new Error(`Resend failed: ${response.status}`);
   }
 }
 
 async function sendViaSmtp(email: string, code: string): Promise<void> {
   const expiresMinutes = env.OTP_EXPIRY_MINUTES;
+  const attachment = logoAttachment();
   const info = await getTransporter().sendMail({
     from: env.SMTP_FROM,
     to: email,
     subject: `${code} is your Knowra sign-in code`,
     text: buildOtpText(code, expiresMinutes),
     html: buildOtpEmailHtml(code, expiresMinutes),
+    attachments: attachment ? [attachment] : undefined,
   });
 
   if (!env.SMTP_HOST && env.NODE_ENV === 'development') {

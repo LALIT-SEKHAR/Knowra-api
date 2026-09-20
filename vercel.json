@@ -6,7 +6,8 @@
       "src": "api/index.ts",
       "use": "@vercel/node",
       "config": {
-        "maxDuration": 300
+        "maxDuration": 300,
+        "includeFiles": ["assets/**"]
       }
     }
   ],
