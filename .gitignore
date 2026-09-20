@@ -7,3 +7,6 @@ dist/
 .DS_Store
 uploads/
 tmp/
+.vercel
+.env*
+!.env.example

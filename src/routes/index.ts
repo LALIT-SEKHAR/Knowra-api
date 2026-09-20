@@ -3,6 +3,7 @@ import authRoutes from './auth.js';
 import settingsRoutes from './settings.js';
 import documentsRoutes from './documents.js';
 import conversationsRoutes from './conversations.js';
+import cronRoutes from './cron.js';
 
 const router = Router();
 
@@ -14,5 +15,6 @@ router.use('/auth', authRoutes);
 router.use('/settings', settingsRoutes);
 router.use('/documents', documentsRoutes);
 router.use('/conversations', conversationsRoutes);
+router.use('/cron', cronRoutes);
 
 export default router;

@@ -26,6 +26,38 @@ export async function enqueueJob(
     attempts: 0,
     nextRunAt: new Date(),
   });
+  scheduleBackgroundProcessing();
+}
+
+/** Drain up to `limit` pending jobs (used on Vercel via waitUntil / cron). */
+export async function processAvailableJobs(limit = 5): Promise<number> {
+  let processed = 0;
+  while (processed < limit) {
+    const job = await claimNextJob();
+    if (!job) break;
+    await handleJob(job);
+    processed += 1;
+  }
+  return processed;
+}
+
+function scheduleBackgroundProcessing(): void {
+  if (process.env.VERCEL !== '1') {
+    return;
+  }
+
+  const run = () =>
+    processAvailableJobs(5).catch((err) => {
+      console.error('Background job processing failed', err);
+    });
+
+  void import('@vercel/functions')
+    .then(({ waitUntil }) => {
+      waitUntil(run());
+    })
+    .catch(() => {
+      void run();
+    });
 }
 
 async function claimNextJob() {
@@ -208,6 +240,10 @@ async function tick() {
 }
 
 export function startJobWorker(): void {
+  if (process.env.VERCEL === '1') {
+    console.log('Job worker: serverless mode (waitUntil / cron)');
+    return;
+  }
   if (timer) return;
   console.log('Job worker started');
   timer = setInterval(() => {
