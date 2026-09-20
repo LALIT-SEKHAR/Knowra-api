@@ -1,4 +1,4 @@
-import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs';
+import { extractText, getDocumentProxy } from 'unpdf';
 import { CHUNK_OVERLAP, CHUNK_SIZE } from '../../config/env.js';
 
 export type PageText = {
@@ -12,16 +12,8 @@ export type TextChunk = {
   chunkIndex: number;
 };
 
-type TextItem = {
-  str?: string;
-  transform?: number[];
-  width?: number;
-  height?: number;
-  hasEOL?: boolean;
-};
-
 /**
- * Extract selectable text from a PDF buffer (Node / pdfjs).
+ * Extract selectable text from a PDF buffer (serverless-safe via unpdf).
  * Does not OCR scanned/image-only PDFs.
  */
 export async function extractPdfPages(buffer: Buffer): Promise<PageText[]> {
@@ -37,84 +29,18 @@ export async function extractPdfPages(buffer: Buffer): Promise<PageText[]> {
     );
   }
 
-  const data = new Uint8Array(buffer);
-  const loadingTask = getDocument({
-    data,
-    useSystemFonts: true,
-    disableFontFace: true,
-    useWorkerFetch: false,
-    isOffscreenCanvasSupported: false,
-  } as Parameters<typeof getDocument>[0]);
+  const pdf = await getDocumentProxy(new Uint8Array(buffer));
+  const { text } = await extractText(pdf, { mergePages: false });
+  const pageTexts = Array.isArray(text) ? text : [text];
 
-  const pdf = await loadingTask.promise;
   const pages: PageText[] = [];
-
-  for (let pageNum = 1; pageNum <= pdf.numPages; pageNum += 1) {
-    const page = await pdf.getPage(pageNum);
-    const content = await page.getTextContent({
-      includeMarkedContent: true,
-      disableNormalization: false,
-    });
-
-    const text = cleanText(itemsToText(content.items as TextItem[]));
-    if (text) {
-      pages.push({ pageNumber: pageNum, text });
+  for (let i = 0; i < pageTexts.length; i += 1) {
+    const cleaned = cleanText(pageTexts[i] ?? '');
+    if (cleaned) {
+      pages.push({ pageNumber: i + 1, text: cleaned });
     }
   }
-
   return pages;
-}
-
-/** Rebuild readable text from pdfjs text items using position + EOL hints. */
-function itemsToText(items: TextItem[]): string {
-  if (!items.length) return '';
-
-  const lines: string[] = [];
-  let currentLine = '';
-  let lastY: number | null = null;
-
-  for (const item of items) {
-    const str = typeof item.str === 'string' ? item.str : '';
-    if (!str && !item.hasEOL) continue;
-
-    const y = item.transform?.[5];
-    const sameLine =
-      lastY === null || y === undefined || Math.abs(y - lastY) < 2;
-
-    if (!sameLine && currentLine.trim()) {
-      lines.push(currentLine.trimEnd());
-      currentLine = '';
-    }
-
-    if (str) {
-      // pdfjs often omits spaces between words; add one when needed
-      if (
-        currentLine &&
-        !currentLine.endsWith(' ') &&
-        !str.startsWith(' ') &&
-        !/[-–—]$/.test(currentLine)
-      ) {
-        currentLine += ' ';
-      }
-      currentLine += str;
-    }
-
-    if (item.hasEOL) {
-      if (currentLine.trim()) {
-        lines.push(currentLine.trimEnd());
-      }
-      currentLine = '';
-      lastY = null;
-    } else if (y !== undefined) {
-      lastY = y;
-    }
-  }
-
-  if (currentLine.trim()) {
-    lines.push(currentLine.trimEnd());
-  }
-
-  return lines.join('\n');
 }
 
 export function cleanText(input: string): string {
