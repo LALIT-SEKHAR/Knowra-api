@@ -22,7 +22,11 @@ const clientOrigins = env.CLIENT_ORIGIN.split(',')
   .map((origin) => origin.trim())
   .filter(Boolean);
 
-app.use(helmet());
+app.use(
+  helmet({
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
+  }),
+);
 app.use(
   cors({
     origin: clientOrigins.length <= 1 ? clientOrigins[0] : clientOrigins,
@@ -53,6 +57,15 @@ app.use((req, res, next) => {
   void ensureReady()
     .then(() => next())
     .catch(next);
+});
+
+app.get('/', (_req, res) => {
+  res.json({
+    ok: true,
+    service: 'knowra-api',
+    health: '/api/health',
+    app: 'https://knowra-cyan.vercel.app',
+  });
 });
 
 app.use('/api', routes);
