@@ -1,6 +1,6 @@
 import mongoose, { Schema, type InferSchemaType, type Model } from 'mongoose';
 
-export const JOB_TYPES = ['process_document', 'delete_document'] as const;
+export const JOB_TYPES = ['process_document', 'delete_document', 'purge_account'] as const;
 export type JobType = (typeof JOB_TYPES)[number];
 
 export const JOB_STATUSES = ['pending', 'processing', 'completed', 'failed'] as const;

@@ -19,9 +19,13 @@ const envSchema = z.object({
   SMTP_USER: z.string().optional().default(''),
   SMTP_PASS: z.string().optional().default(''),
   SMTP_FROM: z.string().default('Knowra <noreply@knowra.app>'),
+  /** Public HTTPS logo URL for emails. Avoids Gmail attachment chips from CID embeds. */
+  EMAIL_LOGO_URL: z.string().optional().default(''),
   RESEND_API_KEY: z.string().optional().default(''),
   CRON_SECRET: z.string().optional().default(''),
   OTP_EXPIRY_MINUTES: z.coerce.number().default(10),
+  /** Minimum seconds between OTP send/resend for the same email+purpose. */
+  OTP_RESEND_COOLDOWN_SECONDS: z.coerce.number().default(60),
   MAX_UPLOAD_BYTES: z.coerce.number().default(20 * 1024 * 1024),
   VECTOR_INDEX_NAME: z.string().default('chunk_embedding_index'),
   NODE_ENV: z.string().default('development'),
@@ -38,6 +42,12 @@ export const env = parsed.data;
 
 export const EMBEDDING_MODEL = 'text-embedding-3-small';
 export const EMBEDDING_DIMENSIONS = 1536;
-export const CHAT_MODEL = 'gpt-4o-mini';
+/** Fixed for document indexing — do not expose as a user preference. */
+export const OCR_MODEL = 'gpt-4o-mini';
+
 export const CHUNK_SIZE = 1000;
 export const CHUNK_OVERLAP = 200;
+export const OCR_MAX_PAGES = 40;
+export const OCR_CONCURRENCY = 2;
+/** Grace period after confirmed deletion request before data is purged. */
+export const ACCOUNT_DELETION_GRACE_DAYS = 7;

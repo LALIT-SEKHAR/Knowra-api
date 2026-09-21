@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import multer from 'multer';
-import rateLimit from 'express-rate-limit';
+import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import { requireAuth } from '../middleware/auth.js';
 import {
   deleteAvatarHandler,
@@ -21,18 +21,28 @@ const avatarUpload = multer({
 
 const otpLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 10,
+  max: 5,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many OTP requests. Try again later.' },
+  keyGenerator: (req) => {
+    const email =
+      typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    return email ? `otp-request:${email}` : ipKeyGenerator(req.ip ?? 'unknown');
+  },
 });
 
 const verifyLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 20,
+  max: 15,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many verification attempts. Try again later.' },
+  keyGenerator: (req) => {
+    const email =
+      typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    return email ? `otp-verify:${email}` : ipKeyGenerator(req.ip ?? 'unknown');
+  },
 });
 
 router.post('/request-otp', otpLimiter, requestOtpHandler);

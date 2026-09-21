@@ -7,7 +7,13 @@ import { DocumentModel } from '../../models/Document.js';
 import { User } from '../../models/User.js';
 import { decryptSecret } from '../../utils/crypto.js';
 import { AppError } from '../../utils/errors.js';
-import { createEmbedding, generateChatAnswer } from '../openai/client.js';
+import {
+  resolveChatSelection,
+  type ChatProviderId,
+} from '../../config/chatProviders.js';
+import { generateChatAnswer } from '../chat/generate.js';
+import { createEmbedding } from '../openai/client.js';
+import { recordUsage } from '../usage/record.js';
 
 export type SourceRef = {
   documentId: string;
@@ -164,7 +170,7 @@ function buildSystemPrompt(scope: 'library' | 'document'): string {
     'For questions about your capabilities, explain that you can search and answer from their uploaded PDFs.',
     'For document questions, use ONLY the provided document context. Do not invent page numbers, document names, or facts.',
     'If a document question cannot be answered from the context, say you cannot find that information in the uploaded documents.',
-    'Be clear and concise.',
+    'Be clear and concise. Prefer short paragraphs and bullet lists over long walls of text. Use Markdown sparingly: bold for key terms, lists for steps or multiple points — avoid heavy headings unless the answer is long.',
   ];
 
   if (scope === 'library') {
@@ -196,12 +202,87 @@ function buildContextBlock(chunks: RetrievedChunk[]): string {
     .join('\n\n');
 }
 
-async function requireApiKey(userId: string): Promise<string> {
+type ChatAccess = {
+  openaiApiKey: string;
+  chatProvider: ChatProviderId;
+  chatModel: string;
+  chatApiKey: string;
+  customBaseUrl?: string | null;
+};
+
+async function requireChatAccess(userId: string): Promise<ChatAccess> {
   const user = await User.findById(userId);
   if (!user?.openaiApiKeyEncrypted) {
-    throw new AppError('Add your OpenAI API key in Settings first', 400);
+    throw new AppError(
+      'Add your OpenAI API key in Settings → AI (needed to search your documents)',
+      400,
+    );
   }
-  return decryptSecret(user.openaiApiKeyEncrypted);
+
+  const { provider, model } = resolveChatSelection(user.chatProvider, user.chatModel);
+  const openaiApiKey = decryptSecret(user.openaiApiKeyEncrypted);
+
+  if (provider === 'openai') {
+    return {
+      openaiApiKey,
+      chatProvider: provider,
+      chatModel: model,
+      chatApiKey: openaiApiKey,
+    };
+  }
+
+  if (provider === 'anthropic') {
+    if (!user.anthropicApiKeyEncrypted) {
+      throw new AppError('Add your Anthropic API key in Settings → AI for Claude chat', 400);
+    }
+    return {
+      openaiApiKey,
+      chatProvider: provider,
+      chatModel: model,
+      chatApiKey: decryptSecret(user.anthropicApiKeyEncrypted),
+    };
+  }
+
+  if (provider === 'google') {
+    if (!user.googleApiKeyEncrypted) {
+      throw new AppError('Add your Google AI API key in Settings → AI for Gemini chat', 400);
+    }
+    return {
+      openaiApiKey,
+      chatProvider: provider,
+      chatModel: model,
+      chatApiKey: decryptSecret(user.googleApiKeyEncrypted),
+    };
+  }
+
+  if (provider === 'xai') {
+    if (!user.xaiApiKeyEncrypted) {
+      throw new AppError('Add your xAI API key in Settings → AI for Grok chat', 400);
+    }
+    return {
+      openaiApiKey,
+      chatProvider: provider,
+      chatModel: model,
+      chatApiKey: decryptSecret(user.xaiApiKeyEncrypted),
+    };
+  }
+
+  if (!user.customBaseUrl?.trim()) {
+    throw new AppError(
+      'Add your custom API base URL in Settings → AI before chatting',
+      400,
+    );
+  }
+
+  return {
+    openaiApiKey,
+    chatProvider: 'custom',
+    chatModel: model,
+    chatApiKey: user.customApiKeyEncrypted
+      ? decryptSecret(user.customApiKeyEncrypted)
+      : 'not-needed',
+    customBaseUrl: user.customBaseUrl,
+  };
 }
 
 async function runChat(params: {
@@ -214,7 +295,8 @@ async function runChat(params: {
   sources: SourceRef[];
   conversationId: string;
 }> {
-  const apiKey = await requireApiKey(params.userId);
+  const access = await requireChatAccess(params.userId);
+  const { openaiApiKey, chatProvider, chatModel, chatApiKey, customBaseUrl } = access;
   const casual = isCasualMessage(params.question);
 
   let documentIds: mongoose.Types.ObjectId[] | null = null;
@@ -285,7 +367,11 @@ async function runChat(params: {
 
   // Greetings / small talk should not force document retrieval.
   if (casual) {
-    const answer = await generateChatAnswer(apiKey, {
+    const answer = await generateChatAnswer({
+      provider: chatProvider,
+      model: chatModel,
+      apiKey: chatApiKey,
+      baseUrl: customBaseUrl,
       system: buildCasualSystemPrompt(),
       messages: [...recentHistory, { role: 'user', content: params.question }],
     });
@@ -298,7 +384,7 @@ async function runChat(params: {
     await Message.create({
       conversationId: conversation._id,
       role: 'assistant',
-      content: answer,
+      content: answer.content,
       sources: [],
     });
 
@@ -308,18 +394,24 @@ async function runChat(params: {
     }
     await conversation.save();
 
+    await recordUsage(params.userId, {
+      chats: 1,
+      chatTokens: answer.usage.totalTokens,
+      aiCalls: 1,
+    });
+
     return {
-      answer,
+      answer: answer.content,
       sources: [],
       conversationId: conversation._id.toString(),
     };
   }
 
-  const queryEmbedding = await createEmbedding(apiKey, params.question);
+  const queryEmbedding = await createEmbedding(openaiApiKey, params.question);
   const retrievedRaw = await vectorSearch(
     params.userId,
     scope === 'library' ? null : documentIds,
-    queryEmbedding,
+    queryEmbedding.embedding,
   );
   const retrieved = await attachDocumentNames(retrievedRaw);
 
@@ -332,7 +424,11 @@ async function runChat(params: {
 
   const context = buildContextBlock(retrieved);
 
-  const answer = await generateChatAnswer(apiKey, {
+  const answer = await generateChatAnswer({
+    provider: chatProvider,
+    model: chatModel,
+    apiKey: chatApiKey,
+    baseUrl: customBaseUrl,
     system: buildSystemPrompt(scope),
     messages: [
       ...recentHistory,
@@ -358,7 +454,7 @@ async function runChat(params: {
   await Message.create({
     conversationId: conversation._id,
     role: 'assistant',
-    content: answer,
+    content: answer.content,
     sources,
   });
 
@@ -368,8 +464,16 @@ async function runChat(params: {
   }
   await conversation.save();
 
+  await recordUsage(params.userId, {
+    chats: 1,
+    chatTokens: answer.usage.totalTokens,
+    embeddings: 1,
+    embeddingTokens: queryEmbedding.usage.totalTokens,
+    aiCalls: 2,
+  });
+
   return {
-    answer,
+    answer: answer.content,
     sources,
     conversationId: conversation._id.toString(),
   };

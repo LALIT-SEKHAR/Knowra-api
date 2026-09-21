@@ -11,6 +11,7 @@ import {
   renameDocumentHandler,
   retryDocumentHandler,
   uploadDocumentHandler,
+  uploadSignatureHandler,
 } from '../controllers/documentsController.js';
 
 const router = Router();
@@ -21,6 +22,7 @@ const upload = multer({
 
 router.use(requireAuth);
 router.get('/', listDocumentsHandler);
+router.get('/upload-signature', uploadSignatureHandler);
 router.post('/', upload.single('file'), uploadDocumentHandler);
 router.get('/:id', getDocumentHandler);
 router.get('/:id/file', downloadDocumentHandler);

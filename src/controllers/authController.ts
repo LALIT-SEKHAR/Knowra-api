@@ -32,6 +32,24 @@ const updateProfileSchema = z.object({
 });
 
 export function serializeUser(user: UserDocument) {
+  const deletionScheduledFor = user.deletionScheduledFor
+    ? new Date(user.deletionScheduledFor)
+    : null;
+  const pendingDeletion =
+    Boolean(deletionScheduledFor) && deletionScheduledFor!.getTime() > Date.now();
+
+  const chatProvider = user.chatProvider ?? 'openai';
+  const hasChatKey =
+    chatProvider === 'openai'
+      ? Boolean(user.openaiApiKeyEncrypted)
+      : chatProvider === 'anthropic'
+        ? Boolean(user.anthropicApiKeyEncrypted)
+        : chatProvider === 'google'
+          ? Boolean(user.googleApiKeyEncrypted)
+          : chatProvider === 'xai'
+            ? Boolean(user.xaiApiKeyEncrypted)
+            : Boolean(user.customBaseUrl);
+
   return {
     id: user._id.toString(),
     email: user.email,
@@ -39,13 +57,27 @@ export function serializeUser(user: UserDocument) {
     avatarUrl: user.avatarUrl ?? null,
     hasOpenAIKey: Boolean(user.openaiApiKeyEncrypted),
     openaiKeyLast4: user.openaiKeyLast4 ?? null,
+    chatProvider,
+    chatModel: user.chatModel ?? 'gpt-4o-mini',
+    hasAnthropicKey: Boolean(user.anthropicApiKeyEncrypted),
+    hasGoogleKey: Boolean(user.googleApiKeyEncrypted),
+    hasXaiKey: Boolean(user.xaiApiKeyEncrypted),
+    hasCustomKey: Boolean(user.customApiKeyEncrypted),
+    customBaseUrl: user.customBaseUrl ?? null,
+    canChat: Boolean(user.openaiApiKeyEncrypted) && hasChatKey,
+    deletionScheduledFor: pendingDeletion ? deletionScheduledFor!.toISOString() : null,
   };
 }
 
 export const requestOtpHandler = asyncHandler(async (req, res) => {
   const body = emailSchema.parse(req.body);
-  await requestOtp(body.email);
-  res.json({ ok: true, message: 'If the email is valid, a code has been sent.' });
+  const result = await requestOtp(body.email);
+  res.json({
+    ok: true,
+    message: 'If the email is valid, a code has been sent.',
+    expiresAt: result.expiresAt.toISOString(),
+    resendAvailableAt: result.resendAvailableAt.toISOString(),
+  });
 });
 
 export const verifyOtpHandler = asyncHandler(async (req, res) => {

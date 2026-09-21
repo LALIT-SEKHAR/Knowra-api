@@ -19,6 +19,8 @@ const documentSchema = new Schema(
     },
     errorMessage: { type: String },
     pageCount: { type: Number },
+    /** 0–100 while processing; 100 when ready */
+    progress: { type: Number, min: 0, max: 100, default: 0 },
   },
   { timestamps: true },
 );

@@ -4,9 +4,14 @@ import { asyncHandler, AppError } from '../utils/errors.js';
 import type { AuthedRequest } from '../middleware/auth.js';
 import { DocumentModel } from '../models/Document.js';
 import { env } from '../config/env.js';
-import { uploadPdfBuffer } from '../services/cloudinary/storage.js';
+import {
+  assertOwnedPdfPublicId,
+  createPdfUploadSignature,
+  uploadPdfBuffer,
+} from '../services/cloudinary/storage.js';
 import { enqueueJob } from '../services/jobs/worker.js';
 import { chatWithDocument } from '../services/rag/chat.js';
+import { recordUsage } from '../services/usage/record.js';
 
 function serializeDocument(doc: InstanceType<typeof DocumentModel>) {
   return {
@@ -18,6 +23,7 @@ function serializeDocument(doc: InstanceType<typeof DocumentModel>) {
     status: doc.status,
     errorMessage: doc.errorMessage ?? null,
     pageCount: doc.pageCount ?? null,
+    progress: typeof doc.progress === 'number' ? doc.progress : null,
     createdAt: doc.createdAt,
     updatedAt: doc.updatedAt,
   };
@@ -39,19 +45,71 @@ export const getDocumentHandler = asyncHandler(async (req: AuthedRequest, res: R
   res.json({ document: serializeDocument(doc) });
 });
 
+export const uploadSignatureHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
+  const user = req.user!;
+  if (!user.openaiApiKeyEncrypted) {
+    throw new AppError('Add your OpenAI API key in Settings before uploading', 400);
+  }
+
+  const filename =
+    typeof req.query.filename === 'string' ? req.query.filename.trim() : '';
+  if (!filename) throw new AppError('filename is required', 400);
+  if (!/\.pdf$/i.test(filename)) {
+    throw new AppError('Only PDF files are supported', 400);
+  }
+
+  res.json({
+    upload: createPdfUploadSignature(filename, user._id.toString()),
+  });
+});
+
+const registerUploadSchema = z.object({
+  name: z.string().min(1).max(255),
+  size: z.number().int().positive().max(env.MAX_UPLOAD_BYTES),
+  mimeType: z.literal('application/pdf'),
+  cloudinaryPublicId: z.string().min(1),
+  cloudinaryUrl: z.string().url(),
+});
+
 export const uploadDocumentHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
+  const user = req.user!;
+  if (!user.openaiApiKeyEncrypted) {
+    throw new AppError('Add your OpenAI API key in Settings before uploading', 400);
+  }
+
+  // Preferred path: file already on Cloudinary (avoids serverless body limits).
+  if (!req.file) {
+    const body = registerUploadSchema.parse(req.body);
+    assertOwnedPdfPublicId(body.cloudinaryPublicId, user._id.toString());
+
+    const doc = await DocumentModel.create({
+      userId: user._id,
+      name: body.name,
+      mimeType: body.mimeType,
+      size: body.size,
+      cloudinaryPublicId: body.cloudinaryPublicId,
+      cloudinaryUrl: body.cloudinaryUrl,
+      status: 'processing',
+      progress: 0,
+    });
+
+    await enqueueJob('process_document', {
+      documentId: doc._id.toString(),
+      userId: user._id.toString(),
+    });
+
+    await recordUsage(user._id.toString(), { uploads: 1 });
+
+    res.status(202).json({ document: serializeDocument(doc) });
+    return;
+  }
+
   const file = req.file;
-  if (!file) throw new AppError('PDF file is required', 400);
   if (file.mimetype !== 'application/pdf') {
     throw new AppError('Only PDF files are supported', 400);
   }
   if (file.size > env.MAX_UPLOAD_BYTES) {
     throw new AppError('File exceeds maximum upload size', 400);
-  }
-
-  const user = req.user!;
-  if (!user.openaiApiKeyEncrypted) {
-    throw new AppError('Add your OpenAI API key in Settings before uploading', 400);
   }
 
   const uploaded = await uploadPdfBuffer(file.buffer, file.originalname, user._id.toString());
@@ -64,12 +122,15 @@ export const uploadDocumentHandler = asyncHandler(async (req: AuthedRequest, res
     cloudinaryPublicId: uploaded.publicId,
     cloudinaryUrl: uploaded.url,
     status: 'processing',
+    progress: 0,
   });
 
   await enqueueJob('process_document', {
     documentId: doc._id.toString(),
     userId: user._id.toString(),
   });
+
+  await recordUsage(user._id.toString(), { uploads: 1 });
 
   res.status(202).json({ document: serializeDocument(doc) });
 });
@@ -120,6 +181,7 @@ export const retryDocumentHandler = asyncHandler(async (req: AuthedRequest, res:
 
   doc.status = 'processing';
   doc.errorMessage = undefined;
+  doc.progress = 0;
   await doc.save();
 
   await enqueueJob('process_document', {

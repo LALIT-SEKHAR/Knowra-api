@@ -62,6 +62,52 @@ export async function uploadPdfBuffer(
   });
 }
 
+/** Signed params for browser → Cloudinary direct upload (avoids Vercel body limits). */
+export function createPdfUploadSignature(
+  filename: string,
+  userId: string,
+): {
+  cloudName: string;
+  apiKey: string;
+  timestamp: number;
+  folder: string;
+  publicId: string;
+  signature: string;
+  resourceType: 'raw';
+} {
+  assertConfigured();
+
+  const timestamp = Math.round(Date.now() / 1000);
+  const safeBase = filename
+    .replace(/\.pdf$/i, '')
+    .replace(/[^a-zA-Z0-9._-]+/g, '_')
+    .slice(0, 80);
+  const publicId = `${safeBase}_${timestamp}`;
+  const folder = `knowra/${userId}`;
+
+  const signature = cloudinary.utils.api_sign_request(
+    { folder, public_id: publicId, timestamp },
+    env.CLOUDINARY_API_SECRET,
+  );
+
+  return {
+    cloudName: env.CLOUDINARY_CLOUD_NAME,
+    apiKey: env.CLOUDINARY_API_KEY,
+    timestamp,
+    folder,
+    publicId,
+    signature,
+    resourceType: 'raw',
+  };
+}
+
+export function assertOwnedPdfPublicId(publicId: string, userId: string): void {
+  const expectedPrefix = `knowra/${userId}/`;
+  if (!publicId.startsWith(expectedPrefix)) {
+    throw new AppError('Invalid upload target', 400);
+  }
+}
+
 export async function deleteCloudinaryFile(publicId: string): Promise<void> {
   assertConfigured();
   await cloudinary.uploader.destroy(publicId, { resource_type: 'raw' });
@@ -93,7 +139,8 @@ export async function uploadAvatarBuffer(
         folder: `knowra/${userId}/avatars`,
         public_id: publicId,
         overwrite: true,
-        transformation: [{ width: 256, height: 256, crop: 'fill', gravity: 'face' }],
+        // Client already square-crops; resize only so face gravity doesn't reframe.
+        transformation: [{ width: 256, height: 256, crop: 'limit' }],
       },
       (error, result) => {
         if (error || !result) {

@@ -9,8 +9,11 @@ import {
   deleteCloudinaryFile,
   downloadCloudinaryFile,
 } from '../cloudinary/storage.js';
-import { chunkPages, extractPdfPages } from '../documents/parser.js';
+import { chunkPages, extractPdfPages, type PageText } from '../documents/parser.js';
+import { ocrPdfPages } from '../documents/ocr.js';
 import { createEmbeddings } from '../openai/client.js';
+import { purgeUserDataCompletely } from '../user/purge.js';
+import { recordUsage } from '../usage/record.js';
 
 const WORKER_ID = `worker-${process.pid}`;
 const POLL_MS = 2000;
@@ -18,13 +21,14 @@ const POLL_MS = 2000;
 export async function enqueueJob(
   type: JobType,
   payload: Record<string, unknown>,
+  options?: { nextRunAt?: Date },
 ): Promise<void> {
   await Job.create({
     type,
     payload,
     status: 'pending',
     attempts: 0,
-    nextRunAt: new Date(),
+    nextRunAt: options?.nextRunAt ?? new Date(),
   });
   scheduleBackgroundProcessing();
 }
@@ -97,14 +101,38 @@ async function processDocumentJob(payload: { documentId: string; userId: string 
     return;
   }
 
+  const setProgress = async (value: number) => {
+    document.progress = Math.max(0, Math.min(100, Math.round(value)));
+    await document.save();
+  };
+
   document.status = 'processing';
   document.errorMessage = undefined;
+  document.progress = 5;
   await document.save();
 
   const buffer = await downloadCloudinaryFile(document.cloudinaryUrl);
-  let pages;
+  await setProgress(12);
+  const apiKey = decryptSecret(user.openaiApiKeyEncrypted);
+
+  let pages: PageText[];
+  let ocrPages = 0;
+  let ocrTokens = 0;
+  let ocrAiCalls = 0;
   try {
     pages = await extractPdfPages(buffer);
+    if (pages.length === 0) {
+      const ocr = await ocrPdfPages(buffer, apiKey, async ({ completedPages, totalPages }) => {
+        const ratio = totalPages > 0 ? completedPages / totalPages : 1;
+        await setProgress(15 + ratio * 50);
+      });
+      pages = ocr.pages;
+      ocrPages = ocr.pageCount;
+      ocrTokens = ocr.usage.totalTokens;
+      ocrAiCalls = ocr.pageCount;
+    } else {
+      await setProgress(55);
+    }
   } catch (err) {
     const message = err instanceof Error ? err.message : 'PDF text extraction failed';
     document.status = 'failed';
@@ -113,20 +141,24 @@ async function processDocumentJob(payload: { documentId: string; userId: string 
     return;
   }
 
+  await setProgress(65);
   const textChunks = chunkPages(pages);
 
   if (textChunks.length === 0) {
     document.status = 'failed';
     document.errorMessage =
-      'No extractable text found in this PDF. Scanned or image-only PDFs are not supported yet — upload a text-based PDF.';
+      'No readable text found in this PDF, even after OCR. Try a clearer scan or a text-based PDF.';
     await document.save();
     return;
   }
 
-  const apiKey = decryptSecret(user.openaiApiKeyEncrypted);
-  const embeddings = await createEmbeddings(
+  const embeddingsResult = await createEmbeddings(
     apiKey,
     textChunks.map((c) => c.content),
+    async (completed, total) => {
+      const ratio = total > 0 ? completed / total : 1;
+      await setProgress(65 + ratio * 30);
+    },
   );
 
   await Chunk.deleteMany({ documentId: document._id });
@@ -135,7 +167,7 @@ async function processDocumentJob(payload: { documentId: string; userId: string 
     documentId: document._id,
     userId: document.userId,
     content: chunk.content,
-    embedding: embeddings[index],
+    embedding: embeddingsResult.embeddings[index],
     pageNumber: chunk.pageNumber,
     chunkIndex: chunk.chunkIndex,
   }));
@@ -144,8 +176,19 @@ async function processDocumentJob(payload: { documentId: string; userId: string 
 
   document.status = 'ready';
   document.pageCount = pages.length;
+  document.progress = 100;
   document.errorMessage = undefined;
   await document.save();
+
+  const embeddingBatches = Math.max(1, Math.ceil(textChunks.length / 64));
+  await recordUsage(payload.userId, {
+    ocrPages,
+    ocrTokens,
+    embeddings: embeddingsResult.embeddings.length,
+    embeddingTokens: embeddingsResult.usage.totalTokens,
+    chunks: textChunks.length,
+    aiCalls: ocrAiCalls + embeddingBatches,
+  });
 }
 
 async function deleteDocumentJob(payload: {
@@ -190,6 +233,16 @@ async function handleJob(job: Awaited<ReturnType<typeof claimNextJob>>) {
           cloudinaryPublicId?: string;
         },
       );
+    } else if (job.type === 'purge_account') {
+      const { userId } = job.payload as { userId: string };
+      const user = await User.findById(userId);
+      // Skip if cancelled or rescheduled further out
+      if (
+        user?.deletionScheduledFor &&
+        user.deletionScheduledFor.getTime() <= Date.now()
+      ) {
+        await purgeUserDataCompletely(userId);
+      }
     }
 
     job.status = 'completed';

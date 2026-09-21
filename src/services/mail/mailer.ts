@@ -1,13 +1,50 @@
-import { existsSync, readFileSync } from 'node:fs';
-import path from 'node:path';
 import nodemailer, { type Transporter } from 'nodemailer';
 import { env } from '../../config/env.js';
+import type { OtpPurpose } from '../../models/Otp.js';
 import { AppError } from '../../utils/errors.js';
 
-const LOGO_CID = 'knowra-logo';
+function otpEmailCopy(purpose: OtpPurpose): {
+  title: string;
+  headline: string;
+  preview: (code: string, expiresMinutes: number) => string;
+  lead: string;
+  subject: (code: string) => string;
+  textLine: (code: string) => string;
+} {
+  if (purpose === 'delete_account') {
+    return {
+      title: 'Knowra account deletion code',
+      headline: 'Confirm account deletion',
+      preview: (code, expiresMinutes) =>
+        `Your Knowra account deletion code is ${code}. Expires in ${expiresMinutes} minutes.`,
+      lead: 'Use this one-time code to permanently delete your Knowra account. It expires in',
+      subject: (code) => `${code} is your Knowra account deletion code`,
+      textLine: (code) => `Your account deletion code is ${code}.`,
+    };
+  }
+  if (purpose === 'delete_files') {
+    return {
+      title: 'Knowra file deletion code',
+      headline: 'Confirm delete all files',
+      preview: (code, expiresMinutes) =>
+        `Your Knowra file deletion code is ${code}. Expires in ${expiresMinutes} minutes.`,
+      lead: 'Use this one-time code to permanently delete all files in your Knowra account. It expires in',
+      subject: (code) => `${code} is your Knowra file deletion code`,
+      textLine: (code) => `Your file deletion code is ${code}.`,
+    };
+  }
+  return {
+    title: 'Knowra sign-in code',
+    headline: 'Your sign-in code',
+    preview: (code, expiresMinutes) =>
+      `Your Knowra sign-in code is ${code}. Expires in ${expiresMinutes} minutes.`,
+    lead: 'Use this one-time code to sign in to Knowra. It expires in',
+    subject: (code) => `${code} is your Knowra sign-in code`,
+    textLine: (code) => `Your sign-in code is ${code}.`,
+  };
+}
 
 let transporter: Transporter | null = null;
-let cachedLogo: { path: string; content: Buffer } | null | undefined;
 
 function getTransporter(): Transporter {
   if (transporter) return transporter;
@@ -39,61 +76,69 @@ function getTransporter(): Transporter {
   return transporter;
 }
 
-function getPublicLogoUrl(): string {
-  const origin = env.CLIENT_ORIGIN.split(',')[0]?.trim().replace(/\/$/, '') ?? '';
-  return origin ? `${origin}/logo.png` : '';
-}
+/**
+ * Hosted HTTPS logo only — never attach files.
+ * Gmail always shows CID/inline MIME parts as an attachment chip in the inbox.
+ */
+function getLogoSrc(): string {
+  const explicit = env.EMAIL_LOGO_URL.trim();
+  if (explicit.startsWith('https://')) return explicit;
 
-function getLogoFile(): { path: string; content: Buffer } | null {
-  if (cachedLogo !== undefined) return cachedLogo;
-
-  const candidates = [
-    path.join(process.cwd(), 'assets', 'logo.png'),
-    path.join(process.cwd(), 'logo.png'),
-  ];
-
-  for (const candidate of candidates) {
-    if (existsSync(candidate)) {
-      cachedLogo = { path: candidate, content: readFileSync(candidate) };
-      return cachedLogo;
-    }
+  for (const raw of env.CLIENT_ORIGIN.split(',')) {
+    const origin = raw.trim().replace(/\/$/, '');
+    if (origin.startsWith('https://')) return `${origin}/logo.png`;
   }
 
-  cachedLogo = null;
-  return null;
+  return '';
 }
 
-function buildOtpEmailHtml(code: string, expiresMinutes: number): string {
+function buildLogoCell(logoSrc: string): string {
+  if (logoSrc) {
+    return `<img src="${logoSrc}" alt="Knowra" width="40" height="40" style="display:block;width:40px;height:40px;border:0;outline:none;text-decoration:none;border-radius:10px;" />`;
+  }
+
+  // HTML mark — no file, so no Gmail attachment chip.
+  return `<span style="display:inline-block;width:40px;height:40px;background:#f5f5f5;border-radius:10px;text-align:center;font-family:Georgia,'Times New Roman',serif;font-size:18px;font-weight:700;color:#0a0a0a;line-height:40px;">K</span>`;
+}
+
+function buildOtpEmailHtml(
+  code: string,
+  expiresMinutes: number,
+  purpose: OtpPurpose = 'login',
+): string {
   const digits = code.split('').map(
     (d) =>
-      `<td style="width:42px;height:52px;background:#1a1a1a;border:1px solid rgba(255,255,255,0.14);border-radius:12px;text-align:center;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:22px;font-weight:700;color:#f5f5f5;letter-spacing:0;">${d}</td>`,
+      `<td style="width:44px;height:54px;background:#1a1a1a;border:1px solid rgba(255,255,255,0.14);border-radius:12px;text-align:center;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:22px;font-weight:700;color:#f5f5f5;letter-spacing:0;">${d}</td>`,
   );
 
   const digitRow = digits.join(
     '<td style="width:8px;font-size:0;line-height:0;">&nbsp;</td>',
   );
 
-  const publicLogo = getPublicLogoUrl();
-  const hasFileLogo = Boolean(getLogoFile());
-  // Prefer hosted logo URL (works in most clients); CID when no public app origin.
-  const logoSrc = publicLogo || (hasFileLogo ? `cid:${LOGO_CID}` : '');
-
-  const logoCell = logoSrc
-    ? `<img src="${logoSrc}" alt="Knowra" width="40" height="40" style="display:block;width:40px;height:40px;border-radius:10px;border:0;" />`
-    : `<span style="display:inline-block;width:40px;height:40px;background:#f5f0e8;border-radius:10px;text-align:center;font-family:Georgia,'Times New Roman',serif;font-size:18px;font-weight:700;color:#0a0a0a;line-height:40px;">K</span>`;
+  const logoCell = buildLogoCell(getLogoSrc());
+  const copy = otpEmailCopy(purpose);
+  const title = copy.title;
+  const headline = copy.headline;
+  const preview = copy.preview(code, expiresMinutes);
+  const lead = copy.lead;
 
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta name="color-scheme" content="dark" />
-  <meta name="supported-color-schemes" content="dark" />
-  <title>Knowra sign-in code</title>
+  <meta name="color-scheme" content="dark light" />
+  <meta name="supported-color-schemes" content="dark light" />
+  <title>${title}</title>
+  <!--[if mso]>
+  <style type="text/css">
+    body, table, td { font-family: Arial, Helvetica, sans-serif !important; }
+  </style>
+  <![endif]-->
 </head>
-<body style="margin:0;padding:0;background:#0a0a0a;font-family:'DM Sans',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
-  <div style="display:none;max-height:0;overflow:hidden;mso-hide:all;">
-    Your Knowra sign-in code is ${code}. Expires in ${expiresMinutes} minutes.
+<body style="margin:0;padding:0;background:#0a0a0a;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+  <div style="display:none;max-height:0;overflow:hidden;mso-hide:all;opacity:0;color:transparent;">
+    ${preview}&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;
   </div>
 
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#0a0a0a;padding:40px 16px;">
@@ -104,12 +149,12 @@ function buildOtpEmailHtml(code: string, expiresMinutes: number): string {
             <td style="padding:28px 32px 20px;border-bottom:1px solid rgba(255,255,255,0.10);">
               <table role="presentation" cellpadding="0" cellspacing="0" border="0">
                 <tr>
-                  <td style="vertical-align:middle;">
+                  <td style="vertical-align:middle;width:40px;">
                     ${logoCell}
                   </td>
-                  <td style="width:12px;font-size:0;">&nbsp;</td>
+                  <td style="width:12px;font-size:0;line-height:0;">&nbsp;</td>
                   <td style="vertical-align:middle;">
-                    <p style="margin:0;font-family:Georgia,'Times New Roman',serif;font-size:26px;font-weight:700;color:#f5f5f5;letter-spacing:-0.02em;line-height:1.1;">Knowra</p>
+                    <p style="margin:0;font-family:Georgia,'Times New Roman',serif;font-size:24px;font-weight:700;color:#f5f5f5;letter-spacing:-0.02em;line-height:1.1;">Knowra</p>
                     <p style="margin:4px 0 0;font-size:12px;color:#a3a3a3;letter-spacing:0.01em;">Ask. Explore. Understand.</p>
                   </td>
                 </tr>
@@ -118,9 +163,9 @@ function buildOtpEmailHtml(code: string, expiresMinutes: number): string {
           </tr>
           <tr>
             <td style="padding:32px;">
-              <h1 style="margin:0 0 10px;font-size:22px;font-weight:600;color:#f5f5f5;line-height:1.3;letter-spacing:-0.01em;">Your sign-in code</h1>
+              <h1 style="margin:0 0 10px;font-size:22px;font-weight:600;color:#f5f5f5;line-height:1.3;letter-spacing:-0.01em;">${headline}</h1>
               <p style="margin:0 0 28px;font-size:15px;line-height:1.55;color:#a3a3a3;">
-                Use this one-time code to sign in to Knowra. It expires in
+                ${lead}
                 <strong style="color:#f5f5f5;">${expiresMinutes} minutes</strong>.
               </p>
               <table role="presentation" cellpadding="0" cellspacing="0" border="0" align="center" style="margin:0 auto 20px;">
@@ -158,51 +203,37 @@ function buildOtpEmailHtml(code: string, expiresMinutes: number): string {
 </html>`;
 }
 
-function buildOtpText(code: string, expiresMinutes: number): string {
+function buildOtpText(
+  code: string,
+  expiresMinutes: number,
+  purpose: OtpPurpose = 'login',
+): string {
+  const line = otpEmailCopy(purpose).textLine(code);
   return [
     'Knowra — Ask. Explore. Understand.',
     '',
-    `Your sign-in code is ${code}.`,
+    line,
     `It expires in ${expiresMinutes} minutes.`,
     '',
     'If you didn’t request this code, you can ignore this email.',
   ].join('\n');
 }
 
-function logoAttachment() {
-  const logo = getLogoFile();
-  if (!logo) return null;
-  return {
-    filename: 'logo.png',
-    content: logo.content,
-    contentType: 'image/png',
-    cid: LOGO_CID,
-    contentDisposition: 'inline' as const,
-  };
-}
-
-/** HTTPS email API — works on Render free (SMTP ports are blocked). */
-async function sendViaResend(email: string, code: string): Promise<void> {
+/** HTTPS email API — useful when SMTP ports are blocked on the host. */
+async function sendViaResend(
+  email: string,
+  code: string,
+  purpose: OtpPurpose,
+): Promise<void> {
   const expiresMinutes = env.OTP_EXPIRY_MINUTES;
-  const logo = getLogoFile();
-  const body: Record<string, unknown> = {
+  const subject = otpEmailCopy(purpose).subject(code);
+  const body = {
     from: env.SMTP_FROM,
     to: [email],
-    subject: `${code} is your Knowra sign-in code`,
-    html: buildOtpEmailHtml(code, expiresMinutes),
-    text: buildOtpText(code, expiresMinutes),
+    subject,
+    html: buildOtpEmailHtml(code, expiresMinutes, purpose),
+    text: buildOtpText(code, expiresMinutes, purpose),
   };
-
-  if (logo) {
-    body.attachments = [
-      {
-        filename: 'logo.png',
-        content: logo.content.toString('base64'),
-        content_id: LOGO_CID,
-        content_type: 'image/png',
-      },
-    ];
-  }
 
   const response = await fetch('https://api.resend.com/emails', {
     method: 'POST',
@@ -220,31 +251,38 @@ async function sendViaResend(email: string, code: string): Promise<void> {
   }
 }
 
-async function sendViaSmtp(email: string, code: string): Promise<void> {
+async function sendViaSmtp(
+  email: string,
+  code: string,
+  purpose: OtpPurpose,
+): Promise<void> {
   const expiresMinutes = env.OTP_EXPIRY_MINUTES;
-  const attachment = logoAttachment();
+  const subject = otpEmailCopy(purpose).subject(code);
   const info = await getTransporter().sendMail({
     from: env.SMTP_FROM,
     to: email,
-    subject: `${code} is your Knowra sign-in code`,
-    text: buildOtpText(code, expiresMinutes),
-    html: buildOtpEmailHtml(code, expiresMinutes),
-    attachments: attachment ? [attachment] : undefined,
+    subject,
+    text: buildOtpText(code, expiresMinutes, purpose),
+    html: buildOtpEmailHtml(code, expiresMinutes, purpose),
   });
 
   if (!env.SMTP_HOST && env.NODE_ENV === 'development') {
     console.log('[dev] OTP email (no SMTP configured):', info.message?.toString?.() ?? info);
-    console.log(`[dev] OTP for ${email}: ${code}`);
+    console.log(`[dev] OTP (${purpose}) for ${email}: ${code}`);
   }
 }
 
-export async function sendOtpEmail(email: string, code: string): Promise<void> {
+export async function sendOtpEmail(
+  email: string,
+  code: string,
+  purpose: OtpPurpose = 'login',
+): Promise<void> {
   try {
     if (env.RESEND_API_KEY) {
-      await sendViaResend(email, code);
+      await sendViaResend(email, code, purpose);
       return;
     }
-    await sendViaSmtp(email, code);
+    await sendViaSmtp(email, code, purpose);
   } catch (err) {
     console.error('Failed to send OTP email', err);
     throw new AppError(
