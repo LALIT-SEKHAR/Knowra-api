@@ -76,20 +76,33 @@ function getTransporter(): Transporter {
   return transporter;
 }
 
+/** Bump when the public mark changes so inbox image caches fetch the new file. */
+const LOGO_VERSION = '2';
+
 /**
  * Hosted HTTPS logo only — never attach files.
  * Gmail always shows CID/inline MIME parts as an attachment chip in the inbox.
  */
 function getLogoSrc(): string {
   const explicit = env.EMAIL_LOGO_URL.trim();
-  if (explicit.startsWith('https://')) return explicit;
+  if (explicit.startsWith('https://')) return withLogoVersion(explicit);
 
   for (const raw of env.CLIENT_ORIGIN.split(',')) {
     const origin = raw.trim().replace(/\/$/, '');
-    if (origin.startsWith('https://')) return `${origin}/logo.png`;
+    if (origin.startsWith('https://')) return withLogoVersion(`${origin}/logo.png`);
   }
 
   return '';
+}
+
+function withLogoVersion(url: string): string {
+  try {
+    const parsed = new URL(url);
+    parsed.searchParams.set('v', LOGO_VERSION);
+    return parsed.toString();
+  } catch {
+    return url;
+  }
 }
 
 function buildLogoCell(logoSrc: string): string {
@@ -98,7 +111,7 @@ function buildLogoCell(logoSrc: string): string {
   }
 
   // HTML mark — no file, so no Gmail attachment chip.
-  return `<span style="display:inline-block;width:40px;height:40px;background:#f5f5f5;border-radius:10px;text-align:center;font-family:Georgia,'Times New Roman',serif;font-size:18px;font-weight:700;color:#0a0a0a;line-height:40px;">K</span>`;
+  return `<span style="display:inline-block;width:40px;height:40px;background:#121212;border-radius:10px;text-align:center;font-family:Georgia,'Times New Roman',serif;font-size:18px;line-height:40px;color:#dcb35a;">&#10022;</span>`;
 }
 
 function buildOtpEmailHtml(
