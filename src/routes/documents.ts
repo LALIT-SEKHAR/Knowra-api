@@ -9,7 +9,9 @@ import {
   getDocumentHandler,
   listDocumentsHandler,
   renameDocumentHandler,
+  previewDocumentHandler,
   retryDocumentHandler,
+  abortUploadHandler,
   uploadDocumentHandler,
   uploadSignatureHandler,
 } from '../controllers/documentsController.js';
@@ -23,9 +25,11 @@ const upload = multer({
 router.use(requireAuth);
 router.get('/', listDocumentsHandler);
 router.get('/upload-signature', uploadSignatureHandler);
+router.post('/upload-abort', abortUploadHandler);
 router.post('/', upload.single('file'), uploadDocumentHandler);
 router.get('/:id', getDocumentHandler);
 router.get('/:id/file', downloadDocumentHandler);
+router.get('/:id/preview', previewDocumentHandler);
 router.patch('/:id', renameDocumentHandler);
 router.delete('/:id', deleteDocumentHandler);
 router.post('/:id/retry', retryDocumentHandler);

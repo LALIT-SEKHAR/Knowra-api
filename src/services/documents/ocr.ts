@@ -1,6 +1,8 @@
+import { createCanvas, loadImage } from '@napi-rs/canvas';
 import { getDocumentProxy, renderPageAsImage } from 'unpdf';
 import { OCR_CONCURRENCY, OCR_MAX_PAGES } from '../../config/env.js';
 import { extractTextFromImage, type TokenUsage } from '../openai/client.js';
+import { assertImageBytes } from './fileTypes.js';
 import { cleanText, type PageText } from './parser.js';
 
 export type OcrProgress = {
@@ -80,5 +82,34 @@ export async function ocrPdfPages(
     pages: pages.filter((page): page is PageText => Boolean(page?.text)),
     usage,
     pageCount: totalPages,
+  };
+}
+
+const OCR_IMAGE_MAX_EDGE = 2048;
+
+/** Read a single uploaded image. Large photos are scaled down before OCR. */
+export async function ocrStandaloneImage(
+  buffer: Buffer,
+  apiKey: string,
+): Promise<OcrPagesResult> {
+  assertImageBytes(buffer);
+  const image = await loadImage(buffer);
+  if (!image.width || !image.height) {
+    throw new Error('This image could not be read.');
+  }
+
+  const scale = Math.min(1, OCR_IMAGE_MAX_EDGE / Math.max(image.width, image.height));
+  const width = Math.max(1, Math.round(image.width * scale));
+  const height = Math.max(1, Math.round(image.height * scale));
+  const canvas = createCanvas(width, height);
+  canvas.getContext('2d').drawImage(image, 0, 0, width, height);
+  const dataUrl = canvas.toDataURL('image/jpeg', 80);
+  const result = await extractTextFromImage(apiKey, dataUrl);
+  const cleaned = cleanText(result.text);
+
+  return {
+    pages: cleaned ? [{ pageNumber: 1, text: cleaned }] : [],
+    usage: result.usage,
+    pageCount: 1,
   };
 }

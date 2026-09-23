@@ -26,7 +26,7 @@ const envSchema = z.object({
   OTP_EXPIRY_MINUTES: z.coerce.number().default(10),
   /** Minimum seconds between OTP send/resend for the same email+purpose. */
   OTP_RESEND_COOLDOWN_SECONDS: z.coerce.number().default(60),
-  MAX_UPLOAD_BYTES: z.coerce.number().default(20 * 1024 * 1024),
+  MAX_UPLOAD_BYTES: z.coerce.number().default(1024 * 1024 * 1024),
   VECTOR_INDEX_NAME: z.string().default('chunk_embedding_index'),
   NODE_ENV: z.string().default('development'),
 });
@@ -39,6 +39,12 @@ if (!parsed.success) {
 }
 
 export const env = parsed.data;
+
+/** Free-plan Cloudinary rejects a single raw object above 10 MiB. */
+export const CLOUDINARY_OBJECT_MAX_BYTES = 10 * 1024 * 1024;
+/** Part size used when a PDF is split so each object stays under that cap. */
+export const CLOUDINARY_PART_BYTES = 9 * 1024 * 1024;
+export const MAX_PDF_PARTS = 120;
 
 export const EMBEDDING_MODEL = 'text-embedding-3-small';
 export const EMBEDDING_DIMENSIONS = 1536;

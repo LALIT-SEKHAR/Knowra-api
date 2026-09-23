@@ -11,6 +11,16 @@ const documentSchema = new Schema(
     size: { type: Number, required: true },
     cloudinaryPublicId: { type: String, required: true },
     cloudinaryUrl: { type: String, required: true },
+    /** Ordered raw objects. Set when the PDF is larger than one Cloudinary object. */
+    cloudinaryParts: {
+      type: [
+        {
+          publicId: { type: String, required: true },
+          url: { type: String, required: true },
+        },
+      ],
+      default: undefined,
+    },
     status: {
       type: String,
       enum: DOCUMENT_STATUSES,

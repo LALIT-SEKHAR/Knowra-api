@@ -6,11 +6,14 @@ import { Message } from '../../models/Message.js';
 import { User } from '../../models/User.js';
 import { decryptSecret } from '../../utils/crypto.js';
 import {
+  cloudinaryUrlsOf,
   deleteCloudinaryFile,
-  downloadCloudinaryFile,
+  downloadCloudinaryFiles,
 } from '../cloudinary/storage.js';
+import { isExcelMime, isImageMime, isWordMime } from '../documents/fileTypes.js';
+import { extractOfficePages } from '../documents/office.js';
 import { chunkPages, extractPdfPages, type PageText } from '../documents/parser.js';
-import { ocrPdfPages } from '../documents/ocr.js';
+import { ocrPdfPages, ocrStandaloneImage } from '../documents/ocr.js';
 import { createEmbeddings } from '../openai/client.js';
 import { purgeUserDataCompletely } from '../user/purge.js';
 import { recordUsage } from '../usage/record.js';
@@ -111,7 +114,7 @@ async function processDocumentJob(payload: { documentId: string; userId: string 
   document.progress = 5;
   await document.save();
 
-  const buffer = await downloadCloudinaryFile(document.cloudinaryUrl);
+  const buffer = await downloadCloudinaryFiles(cloudinaryUrlsOf(document));
   await setProgress(12);
   const apiKey = decryptSecret(user.openaiApiKeyEncrypted);
 
@@ -119,22 +122,38 @@ async function processDocumentJob(payload: { documentId: string; userId: string 
   let ocrPages = 0;
   let ocrTokens = 0;
   let ocrAiCalls = 0;
+  const image = isImageMime(document.mimeType);
+  const office = isWordMime(document.mimeType) || isExcelMime(document.mimeType);
   try {
-    pages = await extractPdfPages(buffer);
-    if (pages.length === 0) {
-      const ocr = await ocrPdfPages(buffer, apiKey, async ({ completedPages, totalPages }) => {
-        const ratio = totalPages > 0 ? completedPages / totalPages : 1;
-        await setProgress(15 + ratio * 50);
-      });
+    if (image) {
+      await setProgress(20);
+      const ocr = await ocrStandaloneImage(buffer, apiKey);
       pages = ocr.pages;
       ocrPages = ocr.pageCount;
       ocrTokens = ocr.usage.totalTokens;
-      ocrAiCalls = ocr.pageCount;
-    } else {
+      ocrAiCalls = 1;
       await setProgress(55);
+    } else if (office) {
+      await setProgress(20);
+      pages = await extractOfficePages(buffer, document.mimeType);
+      await setProgress(55);
+    } else {
+      pages = await extractPdfPages(buffer);
+      if (pages.length === 0) {
+        const ocr = await ocrPdfPages(buffer, apiKey, async ({ completedPages, totalPages }) => {
+          const ratio = totalPages > 0 ? completedPages / totalPages : 1;
+          await setProgress(15 + ratio * 50);
+        });
+        pages = ocr.pages;
+        ocrPages = ocr.pageCount;
+        ocrTokens = ocr.usage.totalTokens;
+        ocrAiCalls = ocr.pageCount;
+      } else {
+        await setProgress(55);
+      }
     }
   } catch (err) {
-    const message = err instanceof Error ? err.message : 'PDF text extraction failed';
+    const message = err instanceof Error ? err.message : 'Could not read this file';
     document.status = 'failed';
     document.errorMessage = message;
     await document.save();
@@ -146,8 +165,13 @@ async function processDocumentJob(payload: { documentId: string; userId: string 
 
   if (textChunks.length === 0) {
     document.status = 'failed';
-    document.errorMessage =
-      'No readable text found in this PDF, even after OCR. Try a clearer scan or a text-based PDF.';
+    document.errorMessage = image
+      ? 'No readable text found in this image.'
+      : isExcelMime(document.mimeType)
+        ? 'No readable text found in this spreadsheet.'
+        : isWordMime(document.mimeType)
+          ? 'No readable text found in this document.'
+          : 'No readable text found in this PDF, even after OCR. Try a clearer scan or a text-based PDF.';
     await document.save();
     return;
   }
@@ -195,12 +219,20 @@ async function deleteDocumentJob(payload: {
   documentId: string;
   userId: string;
   cloudinaryPublicId?: string;
+  cloudinaryPublicIds?: string[];
 }) {
-  const { documentId, userId, cloudinaryPublicId } = payload;
+  const { documentId, userId } = payload;
+  const publicIds = [
+    ...new Set(
+      [...(payload.cloudinaryPublicIds ?? []), payload.cloudinaryPublicId].filter(
+        (id): id is string => Boolean(id),
+      ),
+    ),
+  ];
 
-  if (cloudinaryPublicId) {
+  for (const publicId of publicIds) {
     try {
-      await deleteCloudinaryFile(cloudinaryPublicId);
+      await deleteCloudinaryFile(publicId);
     } catch (err) {
       console.error('Cloudinary delete failed, will retry', err);
       throw err;
@@ -231,6 +263,7 @@ async function handleJob(job: Awaited<ReturnType<typeof claimNextJob>>) {
           documentId: string;
           userId: string;
           cloudinaryPublicId?: string;
+          cloudinaryPublicIds?: string[];
         },
       );
     } else if (job.type === 'purge_account') {

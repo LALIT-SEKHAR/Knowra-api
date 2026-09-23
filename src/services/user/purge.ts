@@ -9,6 +9,7 @@ import { User } from '../../models/User.js';
 import { ACCOUNT_DELETION_GRACE_DAYS } from '../../config/env.js';
 import { AppError } from '../../utils/errors.js';
 import {
+  cloudinaryIdsOf,
   deleteCloudinaryFile,
   deleteCloudinaryImage,
 } from '../cloudinary/storage.js';
@@ -24,13 +25,15 @@ export async function clearUserChatHistory(userId: string): Promise<{ deletedCon
 }
 
 export async function deleteAllUserDocuments(userId: string): Promise<{ deletedDocuments: number }> {
-  const documents = await DocumentModel.find({ userId }).select('_id cloudinaryPublicId');
+  const documents = await DocumentModel.find({ userId }).select(
+    '_id cloudinaryPublicId cloudinaryParts',
+  );
   const documentIds = documents.map((d) => d._id);
 
   for (const doc of documents) {
-    if (doc.cloudinaryPublicId) {
+    for (const publicId of cloudinaryIdsOf(doc)) {
       try {
-        await deleteCloudinaryFile(doc.cloudinaryPublicId);
+        await deleteCloudinaryFile(publicId);
       } catch (err) {
         console.error('Cloudinary delete failed during bulk document delete', err);
       }
@@ -75,11 +78,13 @@ export async function purgeUserDataCompletely(userId: string): Promise<void> {
   }
   await Conversation.deleteMany({ userId });
 
-  const documents = await DocumentModel.find({ userId }).select('_id cloudinaryPublicId');
+  const documents = await DocumentModel.find({ userId }).select(
+    '_id cloudinaryPublicId cloudinaryParts',
+  );
   for (const doc of documents) {
-    if (doc.cloudinaryPublicId) {
+    for (const publicId of cloudinaryIdsOf(doc)) {
       try {
-        await deleteCloudinaryFile(doc.cloudinaryPublicId);
+        await deleteCloudinaryFile(publicId);
       } catch (err) {
         console.error('Cloudinary delete failed during account purge', err);
       }

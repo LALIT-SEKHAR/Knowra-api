@@ -1,5 +1,7 @@
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { v2 as cloudinary } from 'cloudinary';
-import { env } from '../../config/env.js';
+import { CLOUDINARY_PART_BYTES, env } from '../../config/env.js';
 import { AppError } from '../../utils/errors.js';
 
 let configured = false;
@@ -25,18 +27,26 @@ function assertConfigured(): void {
   }
 }
 
+function safeUploadBase(filename: string): string {
+  return filename
+    .replace(/\.(pdf|png|jpe?g|webp|gif|docx?|xlsx?)$/i, '')
+    .replace(/[^a-zA-Z0-9._-]+/g, '_')
+    .slice(0, 80);
+}
+
+function pdfObjectId(filename: string, part: number): string {
+  return `${safeUploadBase(filename)}_${Date.now()}_p${part}`;
+}
+
 export async function uploadPdfBuffer(
   buffer: Buffer,
   filename: string,
   userId: string,
+  part = 0,
 ): Promise<{ publicId: string; url: string; bytes: number }> {
   assertConfigured();
 
-  const safeBase = filename
-    .replace(/\.pdf$/i, '')
-    .replace(/[^a-zA-Z0-9._-]+/g, '_')
-    .slice(0, 80);
-  const publicId = `${safeBase}_${Date.now()}`;
+  const publicId = pdfObjectId(filename, part);
 
   return new Promise((resolve, reject) => {
     const stream = cloudinary.uploader.upload_stream(
@@ -62,10 +72,34 @@ export async function uploadPdfBuffer(
   });
 }
 
+/** Upload a PDF, splitting it so every Cloudinary object stays within the account cap. */
+export async function uploadPdfInParts(
+  buffer: Buffer,
+  filename: string,
+  userId: string,
+): Promise<Array<{ publicId: string; url: string; bytes: number }>> {
+  const uploaded: Array<{ publicId: string; url: string; bytes: number }> = [];
+  try {
+    let part = 0;
+    for (let offset = 0; offset < buffer.length; offset += CLOUDINARY_PART_BYTES) {
+      const slice = buffer.subarray(offset, Math.min(buffer.length, offset + CLOUDINARY_PART_BYTES));
+      uploaded.push(await uploadPdfBuffer(slice, filename, userId, part));
+      part += 1;
+    }
+  } catch (error) {
+    await Promise.all(
+      uploaded.map((item) => deleteCloudinaryFile(item.publicId).catch(() => undefined)),
+    );
+    throw error;
+  }
+  return uploaded;
+}
+
 /** Signed params for browser → Cloudinary direct upload (avoids Vercel body limits). */
 export function createPdfUploadSignature(
   filename: string,
   userId: string,
+  part = 0,
 ): {
   cloudName: string;
   apiKey: string;
@@ -78,11 +112,7 @@ export function createPdfUploadSignature(
   assertConfigured();
 
   const timestamp = Math.round(Date.now() / 1000);
-  const safeBase = filename
-    .replace(/\.pdf$/i, '')
-    .replace(/[^a-zA-Z0-9._-]+/g, '_')
-    .slice(0, 80);
-  const publicId = `${safeBase}_${timestamp}`;
+  const publicId = `${safeUploadBase(filename)}_${timestamp}_p${part}`;
   const folder = `knowra/${userId}`;
 
   const signature = cloudinary.utils.api_sign_request(
@@ -163,6 +193,26 @@ export async function deleteCloudinaryImage(publicId: string): Promise<void> {
   await cloudinary.uploader.destroy(publicId, { resource_type: 'image' });
 }
 
+export function cloudinaryIdsOf(doc: {
+  cloudinaryPublicId?: string | null;
+  cloudinaryParts?: { publicId: string }[] | null;
+}): string[] {
+  const fromParts = (doc.cloudinaryParts ?? []).map((part) => part.publicId).filter(Boolean);
+  if (doc.cloudinaryPublicId && !fromParts.includes(doc.cloudinaryPublicId)) {
+    return [doc.cloudinaryPublicId, ...fromParts];
+  }
+  return fromParts;
+}
+
+export function cloudinaryUrlsOf(doc: {
+  cloudinaryUrl?: string | null;
+  cloudinaryParts?: { url: string }[] | null;
+}): string[] {
+  const fromParts = (doc.cloudinaryParts ?? []).map((part) => part.url).filter(Boolean);
+  if (fromParts.length > 0) return fromParts;
+  return doc.cloudinaryUrl ? [doc.cloudinaryUrl] : [];
+}
+
 export async function downloadCloudinaryFile(url: string): Promise<Buffer> {
   const response = await fetch(url);
   if (!response.ok) {
@@ -170,4 +220,32 @@ export async function downloadCloudinaryFile(url: string): Promise<Buffer> {
   }
   const arrayBuffer = await response.arrayBuffer();
   return Buffer.from(arrayBuffer);
+}
+
+export async function downloadCloudinaryFiles(urls: string[]): Promise<Buffer> {
+  const parts: Buffer[] = [];
+  for (const url of urls) {
+    parts.push(await downloadCloudinaryFile(url));
+  }
+  if (parts.length === 0) throw new AppError('Document file is missing', 404);
+  return parts.length === 1 ? parts[0]! : Buffer.concat(parts);
+}
+
+export async function pipeCloudinaryFiles(
+  urls: string[],
+  destination: NodeJS.WritableStream,
+): Promise<void> {
+  if (urls.length === 0) throw new AppError('Document file is missing', 404);
+  for (const url of urls) {
+    const response = await fetch(url);
+    if (!response.ok || !response.body) {
+      throw new AppError('Failed to download document from storage', 502);
+    }
+    await pipeline(
+      Readable.fromWeb(response.body as import('node:stream/web').ReadableStream),
+      destination,
+      { end: false },
+    );
+  }
+  destination.end();
 }
