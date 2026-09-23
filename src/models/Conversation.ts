@@ -5,6 +5,8 @@ const conversationSchema = new Schema(
     userId: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
     documentId: { type: Schema.Types.ObjectId, ref: 'Document', index: true },
     title: { type: String, trim: true },
+    /** Set after the one-time title is written from the conversation topic. */
+    titleLocked: { type: Boolean, default: false },
   },
   { timestamps: true },
 );

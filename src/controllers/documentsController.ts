@@ -3,9 +3,21 @@ import type { Response } from 'express';
 import { asyncHandler, AppError } from '../utils/errors.js';
 import type { AuthedRequest } from '../middleware/auth.js';
 import { DocumentModel } from '../models/Document.js';
+import { FolderModel } from '../models/Folder.js';
+import {
+  assertFolderOwned,
+  createUserFolder,
+  deleteUserFolder,
+  ensureFolderPath,
+  pathToFolder,
+  resolveBrowse,
+  serializeFolder,
+  updateUserFolder,
+  type FolderPathSegment,
+} from '../services/documents/folders.js';
 import { CLOUDINARY_OBJECT_MAX_BYTES, env, MAX_PDF_PARTS } from '../config/env.js';
 import { isDocumentMime, isOfficeMime, mimeFromFilename } from '../services/documents/fileTypes.js';
-import { extractOfficePages } from '../services/documents/office.js';
+import { previewOfficePages } from '../services/documents/office.js';
 import {
   assertOwnedPdfPublicId,
   cloudinaryIdsOf,
@@ -20,13 +32,17 @@ import { enqueueJob } from '../services/jobs/worker.js';
 import { chatWithDocument } from '../services/rag/chat.js';
 import { recordUsage } from '../services/usage/record.js';
 
-function serializeDocument(doc: InstanceType<typeof DocumentModel>) {
+function serializeDocument(
+  doc: InstanceType<typeof DocumentModel>,
+  path?: FolderPathSegment[],
+) {
   return {
     id: doc._id.toString(),
     name: doc.name,
     mimeType: doc.mimeType,
     size: doc.size,
     cloudinaryUrl: doc.cloudinaryUrl,
+    folderId: doc.folderId ? doc.folderId.toString() : null,
     status: doc.status,
     errorMessage: doc.errorMessage ?? null,
     pageCount: doc.pageCount ?? null,
@@ -37,17 +53,115 @@ function serializeDocument(doc: InstanceType<typeof DocumentModel>) {
       : null,
     createdAt: doc.createdAt,
     updatedAt: doc.updatedAt,
+    ...(path ? { path } : {}),
   };
 }
 
+function nameMatcher(q: string) {
+  const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(escaped, 'i');
+}
+
+const folderIdSchema = z.union([z.string().min(1), z.null()]);
+
 export const listDocumentsHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
   const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
-  const filter: Record<string, unknown> = { userId: req.user!._id };
-  if (q) {
-    filter.name = { $regex: q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
+  const folderParam = typeof req.query.folder === 'string' ? req.query.folder.trim() : '';
+  const userId = req.user!._id;
+
+  if (!folderParam) {
+    const filter: Record<string, unknown> = { userId };
+    if (q) filter.name = nameMatcher(q);
+    const docs = await DocumentModel.find(filter).sort({ updatedAt: -1 });
+    res.json({ documents: docs.map((doc) => serializeDocument(doc)) });
+    return;
   }
-  const docs = await DocumentModel.find(filter).sort({ updatedAt: -1 });
-  res.json({ documents: docs.map(serializeDocument) });
+
+  const browse = await resolveBrowse(userId, folderParam);
+  const breadcrumb = browse.currentId ? pathToFolder(browse.currentId, browse.byId) : [];
+
+  if (!q) {
+    const childFolders = browse.folders
+      .filter((folder) => (folder.parentId ? folder.parentId.toString() : null) === browse.currentId)
+      .sort((a, b) => a.name.localeCompare(b.name));
+    const docs = await DocumentModel.find({
+      userId,
+      folderId: browse.currentId ?? null,
+    }).sort({ updatedAt: -1 });
+    res.json({
+      folders: childFolders.map((folder) => serializeFolder(folder)),
+      documents: docs.map((doc) => serializeDocument(doc)),
+      breadcrumb,
+    });
+    return;
+  }
+
+  const matcher = nameMatcher(q);
+  const matchedFolders = browse.folders
+    .filter((folder) => matcher.test(folder.name))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  const docs = await DocumentModel.find({ userId, name: matcher }).sort({ updatedAt: -1 });
+
+  res.json({
+    folders: matchedFolders.map((folder) => {
+      const parentPath = folder.parentId ? pathToFolder(folder.parentId.toString(), browse.byId) : [];
+      return serializeFolder(folder, parentPath);
+    }),
+    documents: docs.map((doc) =>
+      serializeDocument(
+        doc,
+        doc.folderId ? pathToFolder(doc.folderId.toString(), browse.byId) : [],
+      ),
+    ),
+    breadcrumb,
+  });
+});
+
+export const listFoldersHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
+  const folders = await FolderModel.find({ userId: req.user!._id }).sort({ name: 1 });
+  res.json({ folders: folders.map((folder) => serializeFolder(folder)) });
+});
+
+const createFolderSchema = z.object({
+  name: z.string().min(1).max(120),
+  parentId: folderIdSchema.optional(),
+});
+
+export const createFolderHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
+  const body = createFolderSchema.parse(req.body);
+  const folder = await createUserFolder(req.user!._id, body.name, body.parentId ?? null);
+  res.status(201).json({ folder: serializeFolder(folder) });
+});
+
+const ensureFolderSchema = z.object({
+  parentId: folderIdSchema.optional(),
+  segments: z.array(z.string().min(1).max(120)).min(1).max(8),
+});
+
+export const ensureFolderHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
+  const body = ensureFolderSchema.parse(req.body);
+  const folder = await ensureFolderPath(req.user!._id, body.parentId ?? null, body.segments);
+  res.json({ folder: serializeFolder(folder) });
+});
+
+const updateFolderSchema = z
+  .object({
+    name: z.string().min(1).max(120).optional(),
+    parentId: folderIdSchema.optional(),
+  })
+  .refine((body) => body.name !== undefined || body.parentId !== undefined, {
+    message: 'Nothing to update',
+  });
+
+export const updateFolderHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
+  const body = updateFolderSchema.parse(req.body);
+  const folder = await updateUserFolder(req.user!._id, String(req.params.id), body);
+  res.json({ folder: serializeFolder(folder) });
+});
+
+export const deleteFolderHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
+  const result = await deleteUserFolder(req.user!._id, String(req.params.id));
+  res.json({ ok: true, ...result });
 });
 
 export const getDocumentHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
@@ -102,6 +216,7 @@ const registerUploadSchema = z.object({
   cloudinaryPublicId: z.string().min(1).optional(),
   cloudinaryUrl: z.string().url().optional(),
   parts: z.array(uploadPartSchema).min(1).max(MAX_PDF_PARTS).optional(),
+  folderId: folderIdSchema.optional(),
 });
 
 const abortUploadSchema = z.object({
@@ -142,6 +257,7 @@ export const uploadDocumentHandler = asyncHandler(async (req: AuthedRequest, res
       assertOwnedPdfPublicId(part.cloudinaryPublicId, user._id.toString());
     }
     const first = parts[0]!;
+    const folder = await assertFolderOwned(user._id, body.folderId);
 
     const doc = await DocumentModel.create({
       userId: user._id,
@@ -154,6 +270,7 @@ export const uploadDocumentHandler = asyncHandler(async (req: AuthedRequest, res
         publicId: part.cloudinaryPublicId,
         url: part.cloudinaryUrl,
       })),
+      folderId: folder?._id ?? null,
       status: 'processing',
       progress: 0,
       stage: 'queued',
@@ -182,6 +299,8 @@ export const uploadDocumentHandler = asyncHandler(async (req: AuthedRequest, res
   const uploaded = await uploadPdfInParts(file.buffer, file.originalname, user._id.toString());
   const first = uploaded[0];
   if (!first) throw new AppError('Upload failed', 400);
+  const requestedFolderId = typeof req.body?.folderId === 'string' ? req.body.folderId : null;
+  const folder = await assertFolderOwned(user._id, requestedFolderId);
 
   const doc = await DocumentModel.create({
     userId: user._id,
@@ -194,6 +313,7 @@ export const uploadDocumentHandler = asyncHandler(async (req: AuthedRequest, res
       publicId: part.publicId,
       url: part.url,
     })),
+    folderId: folder?._id ?? null,
     status: 'processing',
     progress: 0,
     stage: 'queued',
@@ -209,15 +329,24 @@ export const uploadDocumentHandler = asyncHandler(async (req: AuthedRequest, res
   res.status(202).json({ document: serializeDocument(doc) });
 });
 
-const renameSchema = z.object({
-  name: z.string().min(1).max(255),
-});
+const renameSchema = z
+  .object({
+    name: z.string().min(1).max(255).optional(),
+    folderId: folderIdSchema.optional(),
+  })
+  .refine((body) => body.name !== undefined || body.folderId !== undefined, {
+    message: 'Nothing to update',
+  });
 
 export const renameDocumentHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
   const body = renameSchema.parse(req.body);
   const doc = await DocumentModel.findOne({ _id: req.params.id, userId: req.user!._id });
   if (!doc) throw new AppError('Document not found', 404);
-  doc.name = body.name.trim();
+  if (body.name !== undefined) doc.name = body.name.trim();
+  if (body.folderId !== undefined) {
+    const folder = await assertFolderOwned(req.user!._id, body.folderId);
+    doc.folderId = folder?._id ?? null;
+  }
   await doc.save();
   res.json({ document: serializeDocument(doc) });
 });
@@ -308,9 +437,9 @@ export const previewDocumentHandler = asyncHandler(async (req: AuthedRequest, re
 
   try {
     const buffer = await downloadCloudinaryFiles(cloudinaryUrlsOf(doc));
-    const pages = await extractOfficePages(buffer, doc.mimeType);
+    const pages = await previewOfficePages(buffer, doc.mimeType);
     res.json({
-      pages: pages.map((page) => ({ pageNumber: page.pageNumber, text: page.text })),
+      pages: pages.map((page) => ({ pageNumber: page.pageNumber, html: page.html })),
       tooLarge: false,
     });
   } catch (error) {

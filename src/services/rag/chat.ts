@@ -1,7 +1,7 @@
 import mongoose from 'mongoose';
 import { env } from '../../config/env.js';
 import { Chunk } from '../../models/Chunk.js';
-import { Conversation } from '../../models/Conversation.js';
+import { Conversation, type ConversationDocument } from '../../models/Conversation.js';
 import { Message } from '../../models/Message.js';
 import { DocumentModel } from '../../models/Document.js';
 import { User } from '../../models/User.js';
@@ -131,37 +131,109 @@ async function attachDocumentNames(chunks: RetrievedChunk[]): Promise<RetrievedC
   }));
 }
 
+const CASUAL = [
+  'hi',
+  'hello',
+  'hey',
+  'hiya',
+  'howdy',
+  'yo',
+  'sup',
+  'good morning',
+  'good afternoon',
+  'good evening',
+  'thanks',
+  'thank you',
+  'thx',
+  'ty',
+  'ok',
+  'okay',
+  'cool',
+  'great',
+  'nice',
+  'bye',
+  'goodbye',
+  'see you',
+  'what can you do',
+  'who are you',
+  'help',
+];
+
 function isCasualMessage(text: string): boolean {
   const normalized = text.trim().toLowerCase().replace(/[!?.]+$/g, '');
   if (!normalized || normalized.length > 80) return false;
-  const casual = [
-    'hi',
-    'hello',
-    'hey',
-    'hiya',
-    'howdy',
-    'yo',
-    'sup',
-    'good morning',
-    'good afternoon',
-    'good evening',
-    'thanks',
-    'thank you',
-    'thx',
-    'ty',
-    'ok',
-    'okay',
-    'cool',
-    'great',
-    'nice',
-    'bye',
-    'goodbye',
-    'see you',
-    'what can you do',
-    'who are you',
-    'help',
-  ];
-  return casual.some((phrase) => normalized === phrase || normalized.startsWith(`${phrase} `));
+  return CASUAL.some((phrase) => normalized === phrase || normalized.startsWith(`${phrase} `));
+}
+
+function cleanGeneratedTitle(raw: string): string {
+  let title = raw.trim().split('\n').find((line) => line.trim()) ?? '';
+  title = title.replace(/^title\s*:\s*/i, '').trim();
+  title = title.replace(/^["'`“”]+|["'`“”]+$/g, '').trim();
+  title = title.replace(/[.!?]+$/g, '').trim();
+  if (title.length > 60) title = title.slice(0, 60).trim();
+  return title;
+}
+
+function conversationForTitle(turns: Array<{ role: string; content: string }>): string {
+  return turns
+    .filter((turn) => (turn.role === 'user' || turn.role === 'assistant') && turn.content.trim())
+    .slice(0, 8)
+    .map((turn) => {
+      const speaker = turn.role === 'user' ? 'User' : 'Assistant';
+      return `${speaker}: ${turn.content.trim().slice(0, 300)}`;
+    })
+    .join('\n\n');
+}
+
+/**
+ * Writes the sidebar title once, from the first exchange — including a greeting or thanks.
+ * Later messages never rename the chat.
+ */
+async function lockConversationTitleOnce(params: {
+  conversation: ConversationDocument;
+  priorMessages: Array<{ role: string; content: string }>;
+  question: string;
+  answer: string;
+  access: ChatAccess;
+  userId: string;
+}): Promise<void> {
+  if (params.conversation.titleLocked) return;
+
+  const transcript = conversationForTitle([
+    ...params.priorMessages,
+    { role: 'user', content: params.question },
+    { role: 'assistant', content: params.answer },
+  ]);
+  if (!transcript) return;
+
+  try {
+    const result = await generateChatAnswer({
+      provider: params.access.chatProvider,
+      model: params.access.chatModel,
+      apiKey: params.access.chatApiKey,
+      baseUrl: params.access.customBaseUrl,
+      temperature: 0.2,
+      maxTokens: 24,
+      system:
+        'Name this chat in 3 to 6 words from what the user and assistant actually said, including greetings and short replies. Reply with the title only. No quotes, no punctuation at the end, no prefix.',
+      messages: [
+        {
+          role: 'user',
+          content: transcript,
+        },
+      ],
+    });
+    const title = cleanGeneratedTitle(result.content);
+    if (title.length < 2) return;
+    params.conversation.title = title;
+    params.conversation.titleLocked = true;
+    await recordUsage(params.userId, {
+      chatTokens: result.usage.totalTokens,
+      aiCalls: 1,
+    });
+  } catch (err) {
+    console.warn('Conversation title was not updated', err);
+  }
 }
 
 function buildSystemPrompt(scope: 'library' | 'document'): string {
@@ -171,14 +243,11 @@ function buildSystemPrompt(scope: 'library' | 'document'): string {
     'For questions about your capabilities, explain that you can search and answer from their uploaded PDFs.',
     'For document questions, use ONLY the provided document context. Do not invent page numbers, document names, or facts.',
     'If a document question cannot be answered from the context, say you cannot find that information in the uploaded documents.',
-    'Be clear and concise. Prefer short paragraphs and bullet lists over long walls of text. Use Markdown sparingly: bold for key terms, lists for steps or multiple points — avoid heavy headings unless the answer is long.',
+    'Be clear and concise. Match the length and shape the user asked for — one line when they ask for one line. Use Markdown sparingly: bold for key terms, lists only when there are several distinct points.',
+    'Phrase every answer freshly. If the user asks the same thing again, keep the facts correct and change the wording and structure. Do not copy an earlier reply, and do not end with a stock offer to ask more questions.',
     [
       'When an answer includes mathematics, write it as Markdown math. Never wrap a formula in parentheses or square brackets.',
-      "Inline symbols use single dollars, for example $g'$, $\\omega$, and $\\lambda = 0^\\circ$.",
-      'Put a displayed equation on its own lines:',
-      '$$',
-      "g' = g - \\omega^2 R \\cos^2\\lambda",
-      '$$',
+      'Inline symbols use single dollars, for example $x^2$ or $\\lambda = 0^\\circ$. A longer equation sits between $$ markers, each on its own line, with nothing else on the closing line.',
       'Use LaTeX commands for Greek letters, subscripts, and superscripts.',
       'Answers are text only. Do not tell the user that a page image will appear under the reply. When they ask for a diagram or figure, explain it from the notes and name the page. Do not redraw the figure as ASCII art.',
     ].join('\n'),
@@ -197,9 +266,9 @@ function buildSystemPrompt(scope: 'library' | 'document'): string {
 function buildCasualSystemPrompt(): string {
   return [
     'You are Knowra, a friendly AI assistant for exploring uploaded PDF documents.',
-    'Reply briefly and warmly to greetings and small talk.',
+    'Reply briefly and warmly to greetings and small talk. Phrase each reply freshly instead of repeating a previous answer.',
     "If asked what you can do, say you can answer questions using the user's uploaded documents.",
-    'Do not invent document contents. Keep replies short.',
+    'Do not invent document contents. Keep replies short. Match the length the user asked for.',
   ].join(' ');
 }
 
@@ -400,6 +469,14 @@ async function runChat(params: {
       sources: [],
     });
 
+    await lockConversationTitleOnce({
+      conversation,
+      priorMessages: history.map((message) => ({ role: message.role, content: message.content })),
+      question: params.question,
+      answer: content,
+      access,
+      userId: params.userId,
+    });
     conversation.updatedAt = new Date();
     if (!conversation.title) {
       conversation.title = params.question.slice(0, 80);
@@ -471,6 +548,14 @@ async function runChat(params: {
     sources,
   });
 
+  await lockConversationTitleOnce({
+    conversation,
+    priorMessages: history.map((message) => ({ role: message.role, content: message.content })),
+    question: params.question,
+    answer: content,
+    access,
+    userId: params.userId,
+  });
   conversation.updatedAt = new Date();
   if (!conversation.title) {
     conversation.title = params.question.slice(0, 80);

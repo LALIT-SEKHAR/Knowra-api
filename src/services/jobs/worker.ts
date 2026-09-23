@@ -309,14 +309,21 @@ async function handleJob(job: Awaited<ReturnType<typeof claimNextJob>>) {
 
     if (attempts >= maxAttempts) {
       job.status = 'failed';
-      if (job.type === 'process_document') {
-        const payload = job.payload as { documentId?: string };
-        if (payload.documentId) {
-          await DocumentModel.findByIdAndUpdate(payload.documentId, {
+      const payload = job.payload as { documentId?: string };
+      if (payload.documentId && job.type === 'process_document') {
+        await DocumentModel.findByIdAndUpdate(payload.documentId, {
+          status: 'failed',
+          errorMessage: publicMessage,
+        });
+      }
+      if (payload.documentId && job.type === 'delete_document') {
+        await DocumentModel.findByIdAndUpdate(payload.documentId, {
+          $set: {
             status: 'failed',
-            errorMessage: publicMessage,
-          });
-        }
+            errorMessage: 'Could not delete this file. Try again from Files.',
+          },
+          $unset: { folderId: 1 },
+        });
       }
     } else {
       job.status = 'pending';

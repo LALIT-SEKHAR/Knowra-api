@@ -37,11 +37,14 @@ const documentSchema = new Schema(
       enum: ['queued', 'downloading', 'reading', 'extracting', 'indexing', 'finishing'],
     },
     processingStartedAt: { type: Date },
+    /** Null when the file sits at the library root. */
+    folderId: { type: Schema.Types.ObjectId, ref: 'Folder', default: null },
   },
   { timestamps: true },
 );
 
 documentSchema.index({ userId: 1, createdAt: -1 });
+documentSchema.index({ userId: 1, folderId: 1, updatedAt: -1 });
 
 export type DocumentDocument = InferSchemaType<typeof documentSchema> & {
   _id: mongoose.Types.ObjectId;

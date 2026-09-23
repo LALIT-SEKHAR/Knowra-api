@@ -9,6 +9,7 @@ import {
   utcDayKey,
   type UsageTotals,
 } from '../services/usage/record.js';
+import { getStorageUsage } from '../services/usage/storage.js';
 
 const LOOKBACK_DAYS = 371; // ~53 weeks so the GitHub-style grid fills evenly
 
@@ -36,12 +37,15 @@ export const getUsageHandler = asyncHandler(async (req: AuthedRequest, res: Resp
   const today = utcDayKey();
   const start = shiftUtcDay(today, -(LOOKBACK_DAYS - 1));
 
-  const rows = await UsageDaily.find({
-    userId,
-    date: { $gte: start, $lte: today },
-  })
-    .sort({ date: 1 })
-    .lean();
+  const [rows, storage] = await Promise.all([
+    UsageDaily.find({
+      userId,
+      date: { $gte: start, $lte: today },
+    })
+      .sort({ date: 1 })
+      .lean(),
+    getStorageUsage(userId),
+  ]);
 
   const byDate = new Map(rows.map((row) => [row.date, row]));
   const daily: Array<{ date: string; level: 0 | 1 | 2 | 3 | 4; score: number } & UsageTotals> = [];
@@ -84,6 +88,7 @@ export const getUsageHandler = asyncHandler(async (req: AuthedRequest, res: Resp
   const totals = periods.year;
 
   res.json({
+    storage,
     totals,
     periods,
     daily: daily.map(({ date, level, score, ...metrics }) => ({

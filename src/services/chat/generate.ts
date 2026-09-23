@@ -5,6 +5,9 @@ import {
 import { AppError } from '../../utils/errors.js';
 import { createOpenAIClient, estimateTokens, withRateLimitRetry, type TokenUsage } from '../openai/client.js';
 
+/** High enough that the same question is phrased differently, low enough to stay accurate. */
+const CHAT_TEMPERATURE = 0.8;
+
 export type ChatMessage = {
   role: 'user' | 'assistant' | 'system';
   content: string;
@@ -18,6 +21,8 @@ export type ChatGenerationParams = {
   apiKey: string;
   /** Required for custom provider */
   baseUrl?: string | null;
+  temperature?: number;
+  maxTokens?: number;
 };
 
 export type ChatGenerationResult = {
@@ -66,7 +71,8 @@ async function generateOpenAICompatible(
     const response = await withRateLimitRetry(() =>
       client.chat.completions.create({
         model: params.model,
-        temperature: 0.2,
+        temperature: params.temperature ?? CHAT_TEMPERATURE,
+        ...(params.maxTokens ? { max_tokens: params.maxTokens } : {}),
         messages: [{ role: 'system', content: params.system }, ...params.messages],
       }),
     );
@@ -128,8 +134,8 @@ async function generateAnthropic(params: ChatGenerationParams): Promise<ChatGene
     },
     body: JSON.stringify({
       model: params.model,
-      max_tokens: 2048,
-      temperature: 0.2,
+      max_tokens: params.maxTokens ?? 2048,
+      temperature: params.temperature ?? CHAT_TEMPERATURE,
       system: params.system,
       messages: history.length > 0 ? history : [{ role: 'user', content: 'Hello' }],
     }),
@@ -182,7 +188,10 @@ async function generateGemini(params: ChatGenerationParams): Promise<ChatGenerat
     body: JSON.stringify({
       systemInstruction: { parts: [{ text: params.system }] },
       contents,
-      generationConfig: { temperature: 0.2 },
+      generationConfig: {
+        temperature: params.temperature ?? CHAT_TEMPERATURE,
+        ...(params.maxTokens ? { maxOutputTokens: params.maxTokens } : {}),
+      },
     }),
   });
 

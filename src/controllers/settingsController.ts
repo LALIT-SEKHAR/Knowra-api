@@ -54,6 +54,11 @@ const otpCodeSchema = z.object({
   code: z.string().min(4).max(10),
 });
 
+const deleteFilesSchema = z.object({
+  code: z.string().min(4).max(10),
+  deleteFolders: z.boolean().optional().default(false),
+});
+
 function hasChatProviderKey(user: UserDocument, provider: ChatProviderId): boolean {
   if (provider === 'openai') return Boolean(user.openaiApiKeyEncrypted);
   if (provider === 'anthropic') return Boolean(user.anthropicApiKeyEncrypted);
@@ -273,12 +278,14 @@ export const requestDeleteFilesOtpHandler = asyncHandler(
 );
 
 export const deleteAllFilesHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
-  const body = otpCodeSchema.parse(req.body);
+  const body = deleteFilesSchema.parse(req.body);
   const user = req.user!;
   if (!user.email) throw new AppError('Account email is missing', 400);
 
   await verifyDeleteFilesOtp(user.email, body.code);
-  const result = await deleteAllUserDocuments(user._id.toString());
+  const result = await deleteAllUserDocuments(user._id.toString(), {
+    deleteFolders: body.deleteFolders,
+  });
   res.json({ ok: true, ...result });
 });
 

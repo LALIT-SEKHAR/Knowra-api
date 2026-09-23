@@ -144,3 +144,151 @@ export async function extractOfficePages(buffer: Buffer, mimeType: string): Prom
   if (isExcelMime(mimeType)) return extractXlsx(buffer);
   throw new Error('This file could not be read.');
 }
+
+export type PreviewPage = { pageNumber: number; html: string };
+
+const PREVIEW_MAX_ROWS = 400;
+const PREVIEW_MAX_COLS = 40;
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function paragraphsToHtml(text: string): string {
+  const blocks = text
+    .split(/\n{2,}/)
+    .map((block) => block.trim())
+    .filter(Boolean);
+  return blocks
+    .map((block) => `<p>${escapeHtml(block).replace(/\n/g, '<br>')}</p>`)
+    .join('');
+}
+
+function tableHtml(name: string, rows: string[][]): string {
+  let width = 0;
+  for (const row of rows) {
+    let end = row.length;
+    while (end > 0 && !(row[end - 1] ?? '').trim()) end -= 1;
+    width = Math.max(width, end);
+  }
+  const truncatedCols = width > PREVIEW_MAX_COLS;
+  if (truncatedCols) width = PREVIEW_MAX_COLS;
+  const used = rows.filter((row) => row.slice(0, width).some((cell) => (cell ?? '').trim()));
+  if (width === 0 || used.length === 0) return '';
+  const truncatedRows = used.length > PREVIEW_MAX_ROWS;
+  const visible = truncatedRows ? used.slice(0, PREVIEW_MAX_ROWS) : used;
+  const body = visible
+    .map((row) => {
+      const cells = Array.from({ length: width }, (_, index) => {
+        return `<td>${escapeHtml(row[index] ?? '')}</td>`;
+      }).join('');
+      return `<tr>${cells}</tr>`;
+    })
+    .join('');
+  const note =
+    truncatedRows || truncatedCols
+      ? `<p>Showing the first ${visible.length} rows and ${width} columns.</p>`
+      : '';
+  return `<h2>${escapeHtml(name)}</h2><table>${body}</table>${note}`;
+}
+
+function xlsxRows(sheet: ExcelJS.Worksheet): string[][] {
+  const rows: string[][] = [];
+  sheet.eachRow({ includeEmpty: false }, (row) => {
+    const cells: string[] = [];
+    row.eachCell({ includeEmpty: false }, (cell) => {
+      const col = typeof cell.col === 'number' ? cell.col : Number(cell.col);
+      if (!Number.isFinite(col) || col < 1) return;
+      cells[col - 1] = excelCellText(cell.value);
+    });
+    if (cells.some((cell) => cell?.trim())) rows.push(cells.map((cell) => cell ?? ''));
+  });
+  return rows;
+}
+
+async function previewDocx(buffer: Buffer): Promise<PreviewPage[]> {
+  if (!isZip(buffer)) throw new Error('This Word document could not be read.');
+  try {
+    const result = await mammoth.convertToHtml(
+      { buffer },
+      {
+        styleMap: [
+          "p[style-name='Title'] => h1:fresh",
+          "p[style-name='Subtitle'] => h2:fresh",
+        ],
+      },
+    );
+    const html = result.value.trim();
+    return html ? [{ pageNumber: 1, html }] : [];
+  } catch {
+    throw new Error('This Word document could not be read.');
+  }
+}
+
+async function previewDoc(buffer: Buffer): Promise<PreviewPage[]> {
+  const pages = await extractDoc(buffer);
+  const html = paragraphsToHtml(pages[0]?.text ?? '');
+  return html ? [{ pageNumber: 1, html }] : [];
+}
+
+async function previewXlsx(buffer: Buffer): Promise<PreviewPage[]> {
+  if (!isZip(buffer)) throw new Error('This spreadsheet could not be read.');
+  const workbook = new ExcelJS.Workbook();
+  try {
+    await workbook.xlsx.load(buffer as unknown as Parameters<typeof workbook.xlsx.load>[0]);
+  } catch {
+    throw new Error('This spreadsheet could not be read.');
+  }
+  const pages: PreviewPage[] = [];
+  workbook.eachSheet((sheet) => {
+    const html = tableHtml(sheet.name, xlsxRows(sheet));
+    if (html) pages.push({ pageNumber: pages.length + 1, html });
+  });
+  return pages;
+}
+
+function previewXls(buffer: Buffer): PreviewPage[] {
+  if (!isOle(buffer)) throw new Error('This spreadsheet could not be read.');
+  let workbook: XLSX.WorkBook;
+  try {
+    workbook = XLSX.read(buffer, { type: 'buffer', cellDates: true });
+  } catch {
+    throw new Error('This spreadsheet could not be read.');
+  }
+  const pages: PreviewPage[] = [];
+  for (const name of workbook.SheetNames) {
+    const sheet = workbook.Sheets[name];
+    if (!sheet) continue;
+    const rows = XLSX.utils.sheet_to_json<(string | number | boolean | Date | null)[]>(sheet, {
+      header: 1,
+      raw: false,
+      defval: '',
+      blankrows: false,
+    });
+    const html = tableHtml(
+      name,
+      rows.map((row) => row.map((cell) => (cell == null ? '' : String(cell)))),
+    );
+    if (html) pages.push({ pageNumber: pages.length + 1, html });
+  }
+  return pages;
+}
+
+export async function previewOfficePages(buffer: Buffer, mimeType: string): Promise<PreviewPage[]> {
+  if (!buffer?.length) throw new Error('This file is empty.');
+  if (mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
+    return previewDocx(buffer);
+  }
+  if (mimeType === 'application/msword') return previewDoc(buffer);
+  if (mimeType === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet') {
+    return previewXlsx(buffer);
+  }
+  if (mimeType === 'application/vnd.ms-excel') return previewXls(buffer);
+  if (isWordMime(mimeType)) return previewDocx(buffer);
+  if (isExcelMime(mimeType)) return previewXlsx(buffer);
+  throw new Error('This file could not be read.');
+}

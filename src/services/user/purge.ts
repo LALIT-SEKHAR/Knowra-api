@@ -1,6 +1,7 @@
 import { Chunk } from '../../models/Chunk.js';
 import { Conversation } from '../../models/Conversation.js';
 import { DocumentModel } from '../../models/Document.js';
+import { FolderModel } from '../../models/Folder.js';
 import { Job } from '../../models/Job.js';
 import { Message } from '../../models/Message.js';
 import { Otp } from '../../models/Otp.js';
@@ -24,7 +25,10 @@ export async function clearUserChatHistory(userId: string): Promise<{ deletedCon
   return { deletedConversations: ids.length };
 }
 
-export async function deleteAllUserDocuments(userId: string): Promise<{ deletedDocuments: number }> {
+export async function deleteAllUserDocuments(
+  userId: string,
+  options: { deleteFolders?: boolean } = {},
+): Promise<{ deletedDocuments: number; deletedFolders: number }> {
   const documents = await DocumentModel.find({ userId }).select(
     '_id cloudinaryPublicId cloudinaryParts',
   );
@@ -56,12 +60,18 @@ export async function deleteAllUserDocuments(userId: string): Promise<{ deletedD
     await DocumentModel.deleteMany({ userId, _id: { $in: documentIds } });
   }
 
+  let deletedFolders = 0;
+  if (options.deleteFolders) {
+    const folderResult = await FolderModel.deleteMany({ userId });
+    deletedFolders = folderResult.deletedCount ?? 0;
+  }
+
   await Job.deleteMany({
     type: { $in: ['process_document', 'delete_document'] },
     'payload.userId': userId,
   });
 
-  return { deletedDocuments: documentIds.length };
+  return { deletedDocuments: documentIds.length, deletedFolders };
 }
 
 /** Full wipe of every record tied to this user (DB + Cloudinary). */
@@ -92,6 +102,7 @@ export async function purgeUserDataCompletely(userId: string): Promise<void> {
   }
   await Chunk.deleteMany({ userId });
   await DocumentModel.deleteMany({ userId });
+  await FolderModel.deleteMany({ userId });
   await Job.deleteMany({ 'payload.userId': userId });
   await UsageDaily.deleteMany({ userId });
 

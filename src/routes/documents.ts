@@ -12,6 +12,11 @@ import {
   previewDocumentHandler,
   retryDocumentHandler,
   abortUploadHandler,
+  createFolderHandler,
+  deleteFolderHandler,
+  ensureFolderHandler,
+  listFoldersHandler,
+  updateFolderHandler,
   uploadDocumentHandler,
   uploadSignatureHandler,
 } from '../controllers/documentsController.js';
@@ -26,6 +31,11 @@ router.use(requireAuth);
 router.get('/', listDocumentsHandler);
 router.get('/upload-signature', uploadSignatureHandler);
 router.post('/upload-abort', abortUploadHandler);
+router.get('/folders', listFoldersHandler);
+router.post('/folders/ensure', ensureFolderHandler);
+router.post('/folders', createFolderHandler);
+router.patch('/folders/:id', updateFolderHandler);
+router.delete('/folders/:id', deleteFolderHandler);
 router.post('/', upload.single('file'), uploadDocumentHandler);
 router.get('/:id', getDocumentHandler);
 router.get('/:id/file', downloadDocumentHandler);
