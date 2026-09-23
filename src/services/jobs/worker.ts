@@ -104,18 +104,24 @@ async function processDocumentJob(payload: { documentId: string; userId: string 
     return;
   }
 
-  const setProgress = async (value: number) => {
+  const setProgress = async (
+    value: number,
+    stage: 'downloading' | 'reading' | 'extracting' | 'indexing' | 'finishing',
+  ) => {
     document.progress = Math.max(0, Math.min(100, Math.round(value)));
+    document.stage = stage;
     await document.save();
   };
 
   document.status = 'processing';
   document.errorMessage = undefined;
   document.progress = 5;
+  document.stage = 'downloading';
+  document.processingStartedAt = new Date();
   await document.save();
 
   const buffer = await downloadCloudinaryFiles(cloudinaryUrlsOf(document));
-  await setProgress(12);
+  await setProgress(12, 'reading');
   const apiKey = decryptSecret(user.openaiApiKeyEncrypted);
 
   let pages: PageText[];
@@ -126,30 +132,30 @@ async function processDocumentJob(payload: { documentId: string; userId: string 
   const office = isWordMime(document.mimeType) || isExcelMime(document.mimeType);
   try {
     if (image) {
-      await setProgress(20);
+      await setProgress(20, 'extracting');
       const ocr = await ocrStandaloneImage(buffer, apiKey);
       pages = ocr.pages;
       ocrPages = ocr.pageCount;
       ocrTokens = ocr.usage.totalTokens;
       ocrAiCalls = 1;
-      await setProgress(55);
+      await setProgress(55, 'extracting');
     } else if (office) {
-      await setProgress(20);
+      await setProgress(20, 'extracting');
       pages = await extractOfficePages(buffer, document.mimeType);
-      await setProgress(55);
+      await setProgress(55, 'extracting');
     } else {
       pages = await extractPdfPages(buffer);
       if (pages.length === 0) {
         const ocr = await ocrPdfPages(buffer, apiKey, async ({ completedPages, totalPages }) => {
           const ratio = totalPages > 0 ? completedPages / totalPages : 1;
-          await setProgress(15 + ratio * 50);
+          await setProgress(15 + ratio * 50, 'extracting');
         });
         pages = ocr.pages;
         ocrPages = ocr.pageCount;
         ocrTokens = ocr.usage.totalTokens;
         ocrAiCalls = ocr.pageCount;
       } else {
-        await setProgress(55);
+        await setProgress(55, 'reading');
       }
     }
   } catch (err) {
@@ -167,7 +173,7 @@ async function processDocumentJob(payload: { documentId: string; userId: string 
     return;
   }
 
-  await setProgress(65);
+  await setProgress(65, 'indexing');
   const textChunks = chunkPages(pages);
 
   if (textChunks.length === 0) {
@@ -188,9 +194,11 @@ async function processDocumentJob(payload: { documentId: string; userId: string 
     textChunks.map((c) => c.content),
     async (completed, total) => {
       const ratio = total > 0 ? completed / total : 1;
-      await setProgress(65 + ratio * 30);
+      await setProgress(65 + ratio * 30, 'indexing');
     },
   );
+
+  await setProgress(96, 'finishing');
 
   await Chunk.deleteMany({ documentId: document._id });
 
@@ -208,6 +216,7 @@ async function processDocumentJob(payload: { documentId: string; userId: string 
   document.status = 'ready';
   document.pageCount = pages.length;
   document.progress = 100;
+  document.stage = undefined;
   document.errorMessage = undefined;
   await document.save();
 

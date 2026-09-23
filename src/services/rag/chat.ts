@@ -12,6 +12,7 @@ import {
   type ChatProviderId,
 } from '../../config/chatProviders.js';
 import { generateChatAnswer } from '../chat/generate.js';
+import { canonicalizeMarkdownMath } from '../chat/markdownMath.js';
 import { createEmbedding } from '../openai/client.js';
 import { recordUsage } from '../usage/record.js';
 
@@ -171,6 +172,16 @@ function buildSystemPrompt(scope: 'library' | 'document'): string {
     'For document questions, use ONLY the provided document context. Do not invent page numbers, document names, or facts.',
     'If a document question cannot be answered from the context, say you cannot find that information in the uploaded documents.',
     'Be clear and concise. Prefer short paragraphs and bullet lists over long walls of text. Use Markdown sparingly: bold for key terms, lists for steps or multiple points — avoid heavy headings unless the answer is long.',
+    [
+      'When an answer includes mathematics, write it as Markdown math. Never wrap a formula in parentheses or square brackets.',
+      "Inline symbols use single dollars, for example $g'$, $\\omega$, and $\\lambda = 0^\\circ$.",
+      'Put a displayed equation on its own lines:',
+      '$$',
+      "g' = g - \\omega^2 R \\cos^2\\lambda",
+      '$$',
+      'Use LaTeX commands for Greek letters, subscripts, and superscripts.',
+      'Answers are text only. Do not tell the user that a page image will appear under the reply. When they ask for a diagram or figure, explain it from the notes and name the page. Do not redraw the figure as ASCII art.',
+    ].join('\n'),
   ];
 
   if (scope === 'library') {
@@ -375,6 +386,7 @@ async function runChat(params: {
       system: buildCasualSystemPrompt(),
       messages: [...recentHistory, { role: 'user', content: params.question }],
     });
+    const content = canonicalizeMarkdownMath(answer.content);
 
     await Message.create({
       conversationId: conversation._id,
@@ -384,7 +396,7 @@ async function runChat(params: {
     await Message.create({
       conversationId: conversation._id,
       role: 'assistant',
-      content: answer.content,
+      content,
       sources: [],
     });
 
@@ -401,7 +413,7 @@ async function runChat(params: {
     });
 
     return {
-      answer: answer.content,
+      answer: content,
       sources: [],
       conversationId: conversation._id.toString(),
     };
@@ -445,6 +457,7 @@ async function runChat(params: {
     chunkId: chunk._id.toString(),
     pageNumber: chunk.pageNumber,
   }));
+  const content = canonicalizeMarkdownMath(answer.content);
 
   await Message.create({
     conversationId: conversation._id,
@@ -454,7 +467,7 @@ async function runChat(params: {
   await Message.create({
     conversationId: conversation._id,
     role: 'assistant',
-    content: answer.content,
+    content,
     sources,
   });
 
@@ -473,7 +486,7 @@ async function runChat(params: {
   });
 
   return {
-    answer: answer.content,
+    answer: content,
     sources,
     conversationId: conversation._id.toString(),
   };

@@ -31,6 +31,12 @@ const documentSchema = new Schema(
     pageCount: { type: Number },
     /** 0–100 while processing; 100 when ready */
     progress: { type: Number, min: 0, max: 100, default: 0 },
+    /** Current processing step, used for status copy and time estimates */
+    stage: {
+      type: String,
+      enum: ['queued', 'downloading', 'reading', 'extracting', 'indexing', 'finishing'],
+    },
+    processingStartedAt: { type: Date },
   },
   { timestamps: true },
 );

@@ -31,6 +31,10 @@ function serializeDocument(doc: InstanceType<typeof DocumentModel>) {
     errorMessage: doc.errorMessage ?? null,
     pageCount: doc.pageCount ?? null,
     progress: typeof doc.progress === 'number' ? doc.progress : null,
+    stage: doc.stage ?? null,
+    processingStartedAt: doc.processingStartedAt
+      ? doc.processingStartedAt.toISOString()
+      : null,
     createdAt: doc.createdAt,
     updatedAt: doc.updatedAt,
   };
@@ -152,6 +156,7 @@ export const uploadDocumentHandler = asyncHandler(async (req: AuthedRequest, res
       })),
       status: 'processing',
       progress: 0,
+      stage: 'queued',
     });
 
     await enqueueJob('process_document', {
@@ -191,6 +196,7 @@ export const uploadDocumentHandler = asyncHandler(async (req: AuthedRequest, res
     })),
     status: 'processing',
     progress: 0,
+    stage: 'queued',
   });
 
   await enqueueJob('process_document', {
@@ -250,6 +256,8 @@ export const retryDocumentHandler = asyncHandler(async (req: AuthedRequest, res:
   doc.status = 'processing';
   doc.errorMessage = undefined;
   doc.progress = 0;
+  doc.stage = 'queued';
+  doc.processingStartedAt = undefined;
   await doc.save();
 
   await enqueueJob('process_document', {
