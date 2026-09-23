@@ -295,7 +295,7 @@ async function handleJob(job: Awaited<ReturnType<typeof claimNextJob>>) {
     const maxAttempts = job.maxAttempts ?? 5;
     const rateLimited = /\b429\b/.test(message) || /rate limit/i.test(message);
     const publicMessage = rateLimited
-      ? 'OpenAI rate limit was reached while reading this file. It will keep trying.'
+      ? 'OpenAI rate limit was reached while reading this file. Retry it in a minute.'
       : message;
 
     if (attempts >= maxAttempts) {
