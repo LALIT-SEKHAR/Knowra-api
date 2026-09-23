@@ -54,6 +54,7 @@ export const OCR_MODEL = 'gpt-4o-mini';
 export const CHUNK_SIZE = 1000;
 export const CHUNK_OVERLAP = 200;
 export const OCR_MAX_PAGES = 40;
-export const OCR_CONCURRENCY = 2;
+/** One page at a time so vision calls don't refill the tokens-per-minute cap. */
+export const OCR_CONCURRENCY = 1;
 /** Grace period after confirmed deletion request before data is purged. */
 export const ACCOUNT_DELETION_GRACE_DAYS = 7;

@@ -3,7 +3,7 @@ import {
   type ChatProviderId,
 } from '../../config/chatProviders.js';
 import { AppError } from '../../utils/errors.js';
-import { createOpenAIClient, estimateTokens, type TokenUsage } from '../openai/client.js';
+import { createOpenAIClient, estimateTokens, withRateLimitRetry, type TokenUsage } from '../openai/client.js';
 
 export type ChatMessage = {
   role: 'user' | 'assistant' | 'system';
@@ -63,11 +63,13 @@ async function generateOpenAICompatible(
 ): Promise<ChatGenerationResult> {
   const client = createOpenAIClient(params.apiKey, baseURL);
   try {
-    const response = await client.chat.completions.create({
-      model: params.model,
-      temperature: 0.2,
-      messages: [{ role: 'system', content: params.system }, ...params.messages],
-    });
+    const response = await withRateLimitRetry(() =>
+      client.chat.completions.create({
+        model: params.model,
+        temperature: 0.2,
+        messages: [{ role: 'system', content: params.system }, ...params.messages],
+      }),
+    );
     const content = response.choices[0]?.message?.content;
     if (!content) throw providerError(params.provider);
     const usage = response.usage

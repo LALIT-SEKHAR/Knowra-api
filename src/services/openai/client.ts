@@ -54,7 +54,52 @@ export function estimateTokens(text: string): number {
 }
 
 export function createOpenAIClient(apiKey: string, baseURL?: string): OpenAI {
-  return new OpenAI({ apiKey, ...(baseURL ? { baseURL } : {}) });
+  return new OpenAI({ apiKey, maxRetries: 0, ...(baseURL ? { baseURL } : {}) });
+}
+
+const RATE_LIMIT_ATTEMPTS = 6;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRateLimitError(error: unknown): boolean {
+  const status =
+    error && typeof error === 'object' && 'status' in error
+      ? (error as { status?: number }).status
+      : undefined;
+  if (status === 429) return true;
+  const message = error instanceof Error ? error.message : '';
+  return /\b429\b/.test(message) || /rate limit/i.test(message);
+}
+
+/** Wait implied by OpenAI's "try again in 248ms" / "try again in 1.2s" text. */
+export function openAIRetryDelayMs(error: unknown, attempt: number): number | null {
+  if (!isRateLimitError(error)) return null;
+  const message = error instanceof Error ? error.message : '';
+  let hinted = 0;
+  const milliseconds = /try again in\s+([\d.]+)\s*ms/i.exec(message);
+  const seconds = /try again in\s+([\d.]+)\s*s\b/i.exec(message);
+  if (milliseconds?.[1]) hinted = Number(milliseconds[1]);
+  else if (seconds?.[1]) hinted = Number(seconds[1]) * 1000;
+  const backoff = Math.min(20_000, 750 * 2 ** attempt);
+  const delay = Math.max(hinted + 300, backoff);
+  return Math.min(60_000, delay);
+}
+
+export async function withRateLimitRetry<T>(run: () => Promise<T>): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < RATE_LIMIT_ATTEMPTS; attempt += 1) {
+    try {
+      return await run();
+    } catch (error) {
+      lastError = error;
+      const delay = openAIRetryDelayMs(error, attempt);
+      if (delay == null || attempt === RATE_LIMIT_ATTEMPTS - 1) throw error;
+      await sleep(delay);
+    }
+  }
+  throw lastError;
 }
 
 export async function validateOpenAIKey(apiKey: string, baseURL?: string): Promise<boolean> {
@@ -65,10 +110,12 @@ export async function validateOpenAIKey(apiKey: string, baseURL?: string): Promi
 
 export async function createEmbedding(apiKey: string, text: string): Promise<EmbeddingResult> {
   const client = createOpenAIClient(apiKey);
-  const response = await client.embeddings.create({
-    model: EMBEDDING_MODEL,
-    input: text,
-  });
+  const response = await withRateLimitRetry(() =>
+    client.embeddings.create({
+      model: EMBEDDING_MODEL,
+      input: text,
+    }),
+  );
   const embedding = response.data[0]?.embedding;
   if (!embedding) {
     throw new AppError('Failed to generate embedding', 502);
@@ -95,10 +142,12 @@ export async function createEmbeddings(
 
   for (let i = 0; i < texts.length; i += batchSize) {
     const batch = texts.slice(i, i + batchSize);
-    const response = await client.embeddings.create({
-      model: EMBEDDING_MODEL,
-      input: batch,
-    });
+    const response = await withRateLimitRetry(() =>
+      client.embeddings.create({
+        model: EMBEDDING_MODEL,
+        input: batch,
+      }),
+    );
     const sorted = [...response.data].sort((a, b) => a.index - b.index);
     for (const item of sorted) {
       results.push(item.embedding);
@@ -121,19 +170,21 @@ const OCR_PROMPT =
 
 export async function extractTextFromImage(apiKey: string, dataUrl: string): Promise<OcrResult> {
   const client = createOpenAIClient(apiKey);
-  const response = await client.chat.completions.create({
-    model: OCR_MODEL,
-    temperature: 0,
-    messages: [
-      {
-        role: 'user',
-        content: [
-          { type: 'text', text: OCR_PROMPT },
-          { type: 'image_url', image_url: { url: dataUrl, detail: 'high' } },
-        ],
-      },
-    ],
-  });
+  const response = await withRateLimitRetry(() =>
+    client.chat.completions.create({
+      model: OCR_MODEL,
+      temperature: 0,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: OCR_PROMPT },
+            { type: 'image_url', image_url: { url: dataUrl, detail: 'high' } },
+          ],
+        },
+      ],
+    }),
+  );
   const text = response.choices[0]?.message?.content ?? '';
   const usage = fromOpenAIUsage(response.usage);
   if (usage.totalTokens === 0) {

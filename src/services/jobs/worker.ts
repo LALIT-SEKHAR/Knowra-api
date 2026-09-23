@@ -154,6 +154,13 @@ async function processDocumentJob(payload: { documentId: string; userId: string 
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Could not read this file';
+    const rateLimited = /\b429\b/.test(message) || /rate limit/i.test(message);
+    if (rateLimited) {
+      document.status = 'processing';
+      document.errorMessage = undefined;
+      await document.save();
+      throw err;
+    }
     document.status = 'failed';
     document.errorMessage = message;
     await document.save();
@@ -286,6 +293,10 @@ async function handleJob(job: Awaited<ReturnType<typeof claimNextJob>>) {
     job.lastError = message;
     const attempts = job.attempts ?? 1;
     const maxAttempts = job.maxAttempts ?? 5;
+    const rateLimited = /\b429\b/.test(message) || /rate limit/i.test(message);
+    const publicMessage = rateLimited
+      ? 'OpenAI rate limit was reached while reading this file. It will keep trying.'
+      : message;
 
     if (attempts >= maxAttempts) {
       job.status = 'failed';
@@ -294,13 +305,15 @@ async function handleJob(job: Awaited<ReturnType<typeof claimNextJob>>) {
         if (payload.documentId) {
           await DocumentModel.findByIdAndUpdate(payload.documentId, {
             status: 'failed',
-            errorMessage: message,
+            errorMessage: publicMessage,
           });
         }
       }
     } else {
       job.status = 'pending';
-      const backoffMs = Math.min(60_000, 2 ** attempts * 1000);
+      const backoffMs = rateLimited
+        ? Math.min(60_000, 15_000 * attempts)
+        : Math.min(60_000, 2 ** attempts * 1000);
       job.nextRunAt = new Date(Date.now() + backoffMs);
     }
     await job.save();
