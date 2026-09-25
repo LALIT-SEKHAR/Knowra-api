@@ -3,6 +3,7 @@ import jwt from 'jsonwebtoken';
 import { env } from '../config/env.js';
 import { AppError } from '../utils/errors.js';
 import { User, type UserDocument } from '../models/User.js';
+import { resolveWorkspace, type Workspace } from '../services/orgs/workspace.js';
 
 export type AuthPayload = {
   userId: string;
@@ -12,6 +13,7 @@ export type AuthPayload = {
 export type AuthedRequest = Request & {
   user?: UserDocument;
   auth?: AuthPayload;
+  workspace?: Workspace;
 };
 
 export function signToken(payload: AuthPayload): string {
@@ -40,6 +42,7 @@ export async function requireAuth(
     }
     req.auth = payload;
     req.user = user;
+    req.workspace = await resolveWorkspace(user);
     next();
   } catch (err) {
     if (err instanceof AppError) {
@@ -48,4 +51,12 @@ export async function requireAuth(
     }
     next(new AppError('Unauthorized', 401));
   }
+}
+
+export function requireManager(req: AuthedRequest, _res: Response, next: NextFunction): void {
+  if (!req.workspace?.canManage) {
+    next(new AppError('Only an organization admin can do that', 403));
+    return;
+  }
+  next();
 }

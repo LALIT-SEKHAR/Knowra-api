@@ -9,7 +9,8 @@ import {
   isAllowedAvatarMime,
   uploadAvatarBuffer,
 } from '../services/cloudinary/storage.js';
-
+import { listMemberships, libraryFilter } from '../services/orgs/workspace.js';
+import { DocumentModel } from '../models/Document.js';
 const AVATAR_MAX_BYTES = 2 * 1024 * 1024;
 
 const emailSchema = z.object({
@@ -19,6 +20,8 @@ const emailSchema = z.object({
 const verifySchema = z.object({
   email: z.string().email(),
   code: z.string().min(4).max(10),
+  orgName: z.string().trim().min(2).max(80).optional(),
+  joinSlug: z.string().trim().min(1).max(80).optional(),
 });
 
 const updateProfileSchema = z.object({
@@ -82,12 +85,49 @@ export const requestOtpHandler = asyncHandler(async (req, res) => {
 
 export const verifyOtpHandler = asyncHandler(async (req, res) => {
   const body = verifySchema.parse(req.body);
-  const result = await verifyOtp(body.email, body.code);
+  const result = await verifyOtp(body.email, body.code, {
+    orgName: body.orgName,
+    joinSlug: body.joinSlug,
+  });
   res.json(result);
 });
 
 export const meHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
-  res.json(serializeUser(req.user!));
+  const workspace = req.workspace!;
+  const keys = workspace.org ?? req.user!;
+  const profile = serializeUser(req.user!);
+  const scoped = serializeUser(keys as UserDocument);
+  const memberships = await listMemberships(req.user!._id);
+  const readyDocumentCount = await DocumentModel.countDocuments({
+    ...libraryFilter(workspace, req.user!._id),
+    status: 'ready',
+  });
+  res.json({
+    ...profile,
+    hasOpenAIKey: scoped.hasOpenAIKey,
+    openaiKeyLast4: workspace.canManage ? scoped.openaiKeyLast4 : null,
+    chatProvider: scoped.chatProvider,
+    chatModel: scoped.chatModel,
+    hasAnthropicKey: scoped.hasAnthropicKey,
+    hasGoogleKey: scoped.hasGoogleKey,
+    hasXaiKey: scoped.hasXaiKey,
+    hasCustomKey: scoped.hasCustomKey,
+    customBaseUrl: workspace.canManage ? scoped.customBaseUrl : null,
+    canChat: scoped.canChat,
+    canManage: workspace.canManage,
+    readyDocumentCount,
+    activeOrg: workspace.org
+      ? {
+          id: workspace.org._id.toString(),
+          name: workspace.org.name,
+          slug: workspace.org.slug,
+          imageUrl: workspace.org.logoUrl ?? null,
+          role: workspace.role,
+          joinsEnabled: workspace.org.joinsEnabled !== false,
+        }
+      : null,
+    memberships,
+  });
 });
 
 export const updateProfileHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {

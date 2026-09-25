@@ -285,6 +285,109 @@ async function sendViaSmtp(
   }
 }
 
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function buildNoticeEmailHtml(headline: string, body: string, preview: string): string {
+  const logoCell = buildLogoCell(getLogoSrc());
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${escapeHtml(headline)}</title>
+</head>
+<body style="margin:0;padding:0;background:#0a0a0a;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+  <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">${escapeHtml(preview)}</div>
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#0a0a0a;padding:40px 16px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:480px;background:#141414;border:1px solid rgba(255,255,255,0.12);border-radius:22px;overflow:hidden;">
+          <tr>
+            <td style="padding:28px 32px 20px;border-bottom:1px solid rgba(255,255,255,0.10);">
+              <table role="presentation" cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                  <td style="vertical-align:middle;width:40px;">${logoCell}</td>
+                  <td style="width:12px;font-size:0;line-height:0;">&nbsp;</td>
+                  <td style="vertical-align:middle;">
+                    <p style="margin:0;font-family:Georgia,'Times New Roman',serif;font-size:24px;font-weight:700;color:#f5f5f5;">Knowra</p>
+                    <p style="margin:4px 0 0;font-size:12px;color:#a3a3a3;">Ask. Explore. Understand.</p>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:32px;">
+              <h1 style="margin:0 0 10px;font-size:22px;font-weight:600;color:#f5f5f5;">${escapeHtml(headline)}</h1>
+              <p style="margin:0;font-size:15px;line-height:1.55;color:#a3a3a3;">${body}</p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:0 32px 28px;">
+              <p style="margin:0;padding-top:20px;border-top:1px solid rgba(255,255,255,0.10);font-size:12px;line-height:1.5;color:#737373;text-align:center;">Sent by Knowra</p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`;
+}
+
+async function deliverEmail(email: string, subject: string, text: string, html: string): Promise<void> {
+  if (env.RESEND_API_KEY) {
+    const response = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${env.RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ from: env.SMTP_FROM, to: [email], subject, html, text }),
+    });
+    if (!response.ok) {
+      const errBody = await response.text();
+      console.error('Resend API error', response.status, errBody);
+      throw new Error(`Resend failed: ${response.status}`);
+    }
+    return;
+  }
+
+  const info = await getTransporter().sendMail({
+    from: env.SMTP_FROM,
+    to: email,
+    subject,
+    text,
+    html,
+  });
+  if (!env.SMTP_HOST && env.NODE_ENV === 'development') {
+    console.log('[dev] email (no SMTP configured):', info.message?.toString?.() ?? info);
+    console.log(`[dev] email for ${email}: ${subject}`);
+  }
+}
+
+export async function sendAdminUpgradeEmail(params: {
+  email: string;
+  orgName: string;
+  promotedBy?: string | null;
+}): Promise<void> {
+  const who = params.promotedBy?.trim() || 'An admin';
+  const headline = `You are now an admin of ${params.orgName}`;
+  const lead = `${who} made you an admin of ${params.orgName}. You can manage files, AI keys, and members for that organization.`;
+  const html = buildNoticeEmailHtml(headline, escapeHtml(lead), lead);
+  try {
+    await deliverEmail(params.email, headline, `${lead}\n`, html);
+  } catch (err) {
+    console.error('Failed to send admin upgrade email', err);
+  }
+}
+
 export async function sendOtpEmail(
   email: string,
   code: string,

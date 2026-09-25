@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import multer from 'multer';
-import { requireAuth } from '../middleware/auth.js';
+import { requireAuth, requireManager } from '../middleware/auth.js';
 import { env } from '../config/env.js';
 import {
   chatDocumentHandler,
@@ -27,7 +27,7 @@ const upload = multer({
   limits: { fileSize: env.MAX_UPLOAD_BYTES },
 });
 
-router.use(requireAuth);
+router.use(requireAuth, requireManager);
 router.get('/', listDocumentsHandler);
 router.get('/upload-signature', uploadSignatureHandler);
 router.post('/upload-abort', abortUploadHandler);

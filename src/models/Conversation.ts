@@ -3,6 +3,7 @@ import mongoose, { Schema, type InferSchemaType, type Model } from 'mongoose';
 const conversationSchema = new Schema(
   {
     userId: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+    orgId: { type: Schema.Types.ObjectId, ref: 'Organization', default: null, index: true },
     documentId: { type: Schema.Types.ObjectId, ref: 'Document', index: true },
     title: { type: String, trim: true },
     /** Set after the one-time title is written from the conversation topic. */

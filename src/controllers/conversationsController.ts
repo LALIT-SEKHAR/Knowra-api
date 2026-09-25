@@ -5,6 +5,7 @@ import type { AuthedRequest } from '../middleware/auth.js';
 import { Conversation } from '../models/Conversation.js';
 import { Message } from '../models/Message.js';
 import { chatAcrossLibrary } from '../services/rag/chat.js';
+import { conversationFilter } from '../services/orgs/workspace.js';
 
 function escapeRegex(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -82,10 +83,11 @@ function serializeSources(
 export const listConversationsHandler = asyncHandler(
   async (req: AuthedRequest, res: Response) => {
     const userId = req.user!._id;
+    const scope = conversationFilter(req.workspace!, userId);
     const q = typeof req.query.q === 'string' ? req.query.q.trim().slice(0, 200) : '';
 
     if (!q) {
-      const conversations = await Conversation.find({ userId }).sort({ updatedAt: -1 });
+      const conversations = await Conversation.find(scope).sort({ updatedAt: -1 });
       res.json({
         conversations: conversations.map((c) => serializeConversation(c)),
       });
@@ -93,7 +95,7 @@ export const listConversationsHandler = asyncHandler(
     }
 
     const matcher = new RegExp(escapeRegex(q), 'i');
-    const owned = await Conversation.find({ userId }).select('_id title');
+    const owned = await Conversation.find(scope).select('_id title');
     const ownedIds = owned.map((c) => c._id);
     const messageHits =
       ownedIds.length === 0
@@ -111,7 +113,7 @@ export const listConversationsHandler = asyncHandler(
     );
     const matchIds = new Set([...titleMatchIds, ...snippets.keys()]);
     const conversations = await Conversation.find({
-      userId,
+      ...scope,
       _id: { $in: ownedIds.filter((id) => matchIds.has(id.toString())) },
     }).sort({ updatedAt: -1 });
 
@@ -128,7 +130,7 @@ export const listConversationsHandler = asyncHandler(
 export const getConversationHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
   const conversation = await Conversation.findOne({
     _id: req.params.id,
-    userId: req.user!._id,
+    ...conversationFilter(req.workspace!, req.user!._id),
   });
   if (!conversation) throw new AppError('Conversation not found', 404);
 
@@ -162,6 +164,7 @@ export const chatHandler = asyncHandler(async (req: AuthedRequest, res: Response
     question: body.question,
     conversationId: body.conversationId,
     documentId: body.documentId,
+    workspace: req.workspace!,
   });
   res.json(result);
 });
@@ -170,7 +173,7 @@ export const deleteConversationHandler = asyncHandler(
   async (req: AuthedRequest, res: Response) => {
     const conversation = await Conversation.findOne({
       _id: req.params.id,
-      userId: req.user!._id,
+      ...conversationFilter(req.workspace!, req.user!._id),
     });
     if (!conversation) throw new AppError('Conversation not found', 404);
 

@@ -31,6 +31,11 @@ import {
 import { enqueueJob } from '../services/jobs/worker.js';
 import { chatWithDocument } from '../services/rag/chat.js';
 import { recordUsage } from '../services/usage/record.js';
+import { libraryFilter } from '../services/orgs/workspace.js';
+
+function owned(req: AuthedRequest) {
+  return libraryFilter(req.workspace!, req.user!._id);
+}
 
 function serializeDocument(
   doc: InstanceType<typeof DocumentModel>,
@@ -68,16 +73,18 @@ export const listDocumentsHandler = asyncHandler(async (req: AuthedRequest, res:
   const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
   const folderParam = typeof req.query.folder === 'string' ? req.query.folder.trim() : '';
   const userId = req.user!._id;
+  const scope = owned(req);
+  const orgId = req.workspace?.orgId ?? null;
 
   if (!folderParam) {
-    const filter: Record<string, unknown> = { userId };
+    const filter: Record<string, unknown> = { ...scope };
     if (q) filter.name = nameMatcher(q);
     const docs = await DocumentModel.find(filter).sort({ updatedAt: -1 });
     res.json({ documents: docs.map((doc) => serializeDocument(doc)) });
     return;
   }
 
-  const browse = await resolveBrowse(userId, folderParam);
+  const browse = await resolveBrowse(userId, folderParam, orgId);
   const breadcrumb = browse.currentId ? pathToFolder(browse.currentId, browse.byId) : [];
 
   if (!q) {
@@ -85,7 +92,7 @@ export const listDocumentsHandler = asyncHandler(async (req: AuthedRequest, res:
       .filter((folder) => (folder.parentId ? folder.parentId.toString() : null) === browse.currentId)
       .sort((a, b) => a.name.localeCompare(b.name));
     const docs = await DocumentModel.find({
-      userId,
+      ...scope,
       folderId: browse.currentId ?? null,
     }).sort({ updatedAt: -1 });
     res.json({
@@ -100,7 +107,7 @@ export const listDocumentsHandler = asyncHandler(async (req: AuthedRequest, res:
   const matchedFolders = browse.folders
     .filter((folder) => matcher.test(folder.name))
     .sort((a, b) => a.name.localeCompare(b.name));
-  const docs = await DocumentModel.find({ userId, name: matcher }).sort({ updatedAt: -1 });
+  const docs = await DocumentModel.find({ ...scope, name: matcher }).sort({ updatedAt: -1 });
 
   res.json({
     folders: matchedFolders.map((folder) => {
@@ -118,7 +125,7 @@ export const listDocumentsHandler = asyncHandler(async (req: AuthedRequest, res:
 });
 
 export const listFoldersHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
-  const folders = await FolderModel.find({ userId: req.user!._id }).sort({ name: 1 });
+  const folders = await FolderModel.find(owned(req)).sort({ name: 1 });
   res.json({ folders: folders.map((folder) => serializeFolder(folder)) });
 });
 
@@ -129,7 +136,7 @@ const createFolderSchema = z.object({
 
 export const createFolderHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
   const body = createFolderSchema.parse(req.body);
-  const folder = await createUserFolder(req.user!._id, body.name, body.parentId ?? null);
+  const folder = await createUserFolder(req.user!._id, body.name, body.parentId ?? null, req.workspace?.orgId);
   res.status(201).json({ folder: serializeFolder(folder) });
 });
 
@@ -140,7 +147,12 @@ const ensureFolderSchema = z.object({
 
 export const ensureFolderHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
   const body = ensureFolderSchema.parse(req.body);
-  const folder = await ensureFolderPath(req.user!._id, body.parentId ?? null, body.segments);
+  const folder = await ensureFolderPath(
+    req.user!._id,
+    body.parentId ?? null,
+    body.segments,
+    req.workspace?.orgId,
+  );
   res.json({ folder: serializeFolder(folder) });
 });
 
@@ -155,24 +167,25 @@ const updateFolderSchema = z
 
 export const updateFolderHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
   const body = updateFolderSchema.parse(req.body);
-  const folder = await updateUserFolder(req.user!._id, String(req.params.id), body);
+  const folder = await updateUserFolder(req.user!._id, String(req.params.id), body, req.workspace?.orgId);
   res.json({ folder: serializeFolder(folder) });
 });
 
 export const deleteFolderHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
-  const result = await deleteUserFolder(req.user!._id, String(req.params.id));
+  const result = await deleteUserFolder(req.user!._id, String(req.params.id), req.workspace?.orgId);
   res.json({ ok: true, ...result });
 });
 
 export const getDocumentHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
-  const doc = await DocumentModel.findOne({ _id: req.params.id, userId: req.user!._id });
+  const doc = await DocumentModel.findOne({ _id: req.params.id, ...owned(req) });
   if (!doc) throw new AppError('Document not found', 404);
   res.json({ document: serializeDocument(doc) });
 });
 
 export const uploadSignatureHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
   const user = req.user!;
-  if (!user.openaiApiKeyEncrypted) {
+  const keys = req.workspace?.org ?? user;
+  if (!keys.openaiApiKeyEncrypted) {
     throw new AppError('Add your OpenAI API key in Settings before uploading', 400);
   }
 
@@ -225,7 +238,8 @@ const abortUploadSchema = z.object({
 
 export const uploadDocumentHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
   const user = req.user!;
-  if (!user.openaiApiKeyEncrypted) {
+  const keys = req.workspace?.org ?? user;
+  if (!keys.openaiApiKeyEncrypted) {
     throw new AppError('Add your OpenAI API key in Settings before uploading', 400);
   }
 
@@ -257,10 +271,11 @@ export const uploadDocumentHandler = asyncHandler(async (req: AuthedRequest, res
       assertOwnedPdfPublicId(part.cloudinaryPublicId, user._id.toString());
     }
     const first = parts[0]!;
-    const folder = await assertFolderOwned(user._id, body.folderId);
+    const folder = await assertFolderOwned(user._id, body.folderId, req.workspace?.orgId);
 
     const doc = await DocumentModel.create({
       userId: user._id,
+      orgId: req.workspace?.orgId ?? null,
       name: body.name,
       mimeType: body.mimeType,
       size: body.size,
@@ -300,10 +315,11 @@ export const uploadDocumentHandler = asyncHandler(async (req: AuthedRequest, res
   const first = uploaded[0];
   if (!first) throw new AppError('Upload failed', 400);
   const requestedFolderId = typeof req.body?.folderId === 'string' ? req.body.folderId : null;
-  const folder = await assertFolderOwned(user._id, requestedFolderId);
+  const folder = await assertFolderOwned(user._id, requestedFolderId, req.workspace?.orgId);
 
   const doc = await DocumentModel.create({
     userId: user._id,
+    orgId: req.workspace?.orgId ?? null,
     name: file.originalname,
     mimeType,
     size: file.size,
@@ -340,7 +356,7 @@ const renameSchema = z
 
 export const renameDocumentHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
   const body = renameSchema.parse(req.body);
-  const doc = await DocumentModel.findOne({ _id: req.params.id, userId: req.user!._id });
+  const doc = await DocumentModel.findOne({ _id: req.params.id, ...owned(req) });
   if (!doc) throw new AppError('Document not found', 404);
   if (body.name !== undefined) doc.name = body.name.trim();
   if (body.folderId !== undefined) {
@@ -352,7 +368,7 @@ export const renameDocumentHandler = asyncHandler(async (req: AuthedRequest, res
 });
 
 export const deleteDocumentHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
-  const doc = await DocumentModel.findOne({ _id: req.params.id, userId: req.user!._id });
+  const doc = await DocumentModel.findOne({ _id: req.params.id, ...owned(req) });
   if (!doc) throw new AppError('Document not found', 404);
 
   const documentId = doc._id.toString();
@@ -372,13 +388,14 @@ export const deleteDocumentHandler = asyncHandler(async (req: AuthedRequest, res
 });
 
 export const retryDocumentHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
-  const doc = await DocumentModel.findOne({ _id: req.params.id, userId: req.user!._id });
+  const doc = await DocumentModel.findOne({ _id: req.params.id, ...owned(req) });
   if (!doc) throw new AppError('Document not found', 404);
   if (doc.status !== 'failed') {
     throw new AppError('Only failed documents can be retried', 400);
   }
 
-  if (!req.user!.openaiApiKeyEncrypted) {
+  const keys = req.workspace?.org ?? req.user!;
+  if (!keys.openaiApiKeyEncrypted) {
     throw new AppError('Add your OpenAI API key in Settings first', 400);
   }
 
@@ -405,7 +422,7 @@ export const abortUploadHandler = asyncHandler(async (req: AuthedRequest, res: R
   }
 
   const saved = await DocumentModel.find({
-    userId: req.user!._id,
+    ...owned(req),
     $or: [
       { cloudinaryPublicId: { $in: body.publicIds } },
       { 'cloudinaryParts.publicId': { $in: body.publicIds } },
@@ -425,7 +442,7 @@ export const abortUploadHandler = asyncHandler(async (req: AuthedRequest, res: R
 const OFFICE_PREVIEW_MAX_BYTES = 32 * 1024 * 1024;
 
 export const previewDocumentHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
-  const doc = await DocumentModel.findOne({ _id: req.params.id, userId: req.user!._id });
+  const doc = await DocumentModel.findOne({ _id: req.params.id, ...owned(req) });
   if (!doc) throw new AppError('Document not found', 404);
   if (!isOfficeMime(doc.mimeType)) {
     throw new AppError('Preview is only available for Word and Excel files', 400);
@@ -449,7 +466,7 @@ export const previewDocumentHandler = asyncHandler(async (req: AuthedRequest, re
 });
 
 export const downloadDocumentHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
-  const doc = await DocumentModel.findOne({ _id: req.params.id, userId: req.user!._id });
+  const doc = await DocumentModel.findOne({ _id: req.params.id, ...owned(req) });
   if (!doc) throw new AppError('Document not found', 404);
 
   const urls = cloudinaryUrlsOf(doc);
@@ -476,6 +493,7 @@ export const chatDocumentHandler = asyncHandler(async (req: AuthedRequest, res: 
     documentId,
     question: body.question,
     conversationId: body.conversationId,
+    workspace: req.workspace!,
   });
   res.json(result);
 });

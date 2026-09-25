@@ -4,6 +4,7 @@ import { Chunk } from '../../models/Chunk.js';
 import { Conversation } from '../../models/Conversation.js';
 import { Message } from '../../models/Message.js';
 import { User } from '../../models/User.js';
+import { Organization } from '../../models/Organization.js';
 import { decryptSecret } from '../../utils/crypto.js';
 import {
   cloudinaryUrlsOf,
@@ -96,8 +97,10 @@ async function processDocumentJob(payload: { documentId: string; userId: string 
     throw new Error('Document not found');
   }
 
-  const user = await User.findById(payload.userId);
-  if (!user?.openaiApiKeyEncrypted) {
+  const keyOwner = document.orgId
+    ? await Organization.findById(document.orgId)
+    : await User.findById(payload.userId);
+  if (!keyOwner?.openaiApiKeyEncrypted) {
     document.status = 'failed';
     document.errorMessage = 'OpenAI API key is required in Settings before processing';
     await document.save();
@@ -122,7 +125,7 @@ async function processDocumentJob(payload: { documentId: string; userId: string 
 
   const buffer = await downloadCloudinaryFiles(cloudinaryUrlsOf(document));
   await setProgress(12, 'reading');
-  const apiKey = decryptSecret(user.openaiApiKeyEncrypted);
+  const apiKey = decryptSecret(keyOwner.openaiApiKeyEncrypted);
 
   let pages: PageText[];
   let ocrPages = 0;
@@ -205,6 +208,7 @@ async function processDocumentJob(payload: { documentId: string; userId: string 
   const docs = textChunks.map((chunk, index) => ({
     documentId: document._id,
     userId: document.userId,
+    orgId: document.orgId ?? null,
     content: chunk.content,
     embedding: embeddingsResult.embeddings[index],
     pageNumber: chunk.pageNumber,

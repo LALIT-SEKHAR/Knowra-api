@@ -30,6 +30,7 @@ import {
 } from '../services/user/purge.js';
 import { enqueueJob } from '../services/jobs/worker.js';
 import { serializeUser } from './authController.js';
+import { orgsNeedingSuccessor } from '../services/orgs/workspace.js';
 
 const keySchema = z.object({
   apiKey: z.string().min(10),
@@ -92,8 +93,29 @@ export function settingsPayload(user: UserDocument) {
   };
 }
 
+function editableKeys(req: AuthedRequest): UserDocument {
+  if (!req.workspace?.canManage) {
+    throw new AppError('Only an organization admin can change AI setup', 403);
+  }
+  return (req.workspace.org ?? req.user!) as UserDocument;
+}
+
 export const getSettingsHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
-  res.json(settingsPayload(req.user!));
+  const source = req.workspace?.org ?? req.user!;
+  const payload = settingsPayload(source as UserDocument);
+  if (req.workspace?.canManage) {
+    res.json(payload);
+    return;
+  }
+  res.json({
+    ...payload,
+    openaiKeyLast4: null,
+    anthropicKeyLast4: null,
+    googleKeyLast4: null,
+    xaiKeyLast4: null,
+    customKeyLast4: null,
+    customBaseUrl: null,
+  });
 });
 
 export const putOpenAIKeyHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
@@ -105,7 +127,7 @@ export const putOpenAIKeyHandler = asyncHandler(async (req: AuthedRequest, res: 
     throw new AppError('Invalid OpenAI API key', 400);
   }
 
-  const user = req.user!;
+  const user = editableKeys(req);
   user.openaiApiKeyEncrypted = encryptSecret(apiKey);
   user.openaiKeyLast4 = lastFour(apiKey);
   await user.save();
@@ -114,7 +136,7 @@ export const putOpenAIKeyHandler = asyncHandler(async (req: AuthedRequest, res: 
 });
 
 export const deleteOpenAIKeyHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
-  const user = req.user!;
+  const user = editableKeys(req);
   user.openaiApiKeyEncrypted = undefined;
   user.openaiKeyLast4 = undefined;
   await user.save();
@@ -123,7 +145,7 @@ export const deleteOpenAIKeyHandler = asyncHandler(async (req: AuthedRequest, re
 
 export const putChatPrefsHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
   const body = chatPrefsSchema.parse(req.body);
-  const user = req.user!;
+  const user = editableKeys(req);
   const { provider, model } = resolveChatSelection(body.chatProvider, body.chatModel);
 
   if (provider === 'custom' && body.customBaseUrl) {
@@ -168,7 +190,7 @@ export const putChatModelHandler = asyncHandler(async (req: AuthedRequest, res: 
     })
     .parse(req.body);
 
-  const user = req.user!;
+  const user = editableKeys(req);
   const provider = (body.chatProvider ?? user.chatProvider ?? DEFAULT_CHAT_PROVIDER) as ChatProviderId;
   const resolved = resolveChatSelection(provider, body.chatModel);
   if (!hasChatProviderKey(user, resolved.provider)) {
@@ -182,7 +204,7 @@ export const putChatModelHandler = asyncHandler(async (req: AuthedRequest, res: 
 
 export const putProviderKeyHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
   const body = providerKeySchema.parse(req.body);
-  const user = req.user!;
+  const user = editableKeys(req);
   const apiKey = body.apiKey.trim();
 
   if (body.provider === 'custom') {
@@ -231,7 +253,7 @@ export const putProviderKeyHandler = asyncHandler(async (req: AuthedRequest, res
 
 export const deleteProviderKeyHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
   const provider = z.enum(['anthropic', 'google', 'xai', 'custom']).parse(req.params.provider);
-  const user = req.user!;
+  const user = editableKeys(req);
 
   if (provider === 'anthropic') {
     user.anthropicApiKeyEncrypted = undefined;
@@ -258,12 +280,18 @@ export const deleteProviderKeyHandler = asyncHandler(async (req: AuthedRequest, 
 });
 
 export const clearChatsHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
-  const result = await clearUserChatHistory(req.user!._id.toString());
+  const result = await clearUserChatHistory(
+    req.user!._id.toString(),
+    req.workspace?.orgId?.toString() ?? null,
+  );
   res.json({ ok: true, ...result });
 });
 
 export const requestDeleteFilesOtpHandler = asyncHandler(
   async (req: AuthedRequest, res: Response) => {
+    if (!req.workspace?.canManage) {
+      throw new AppError('Only an organization admin can delete files', 403);
+    }
     const email = req.user!.email;
     if (!email) throw new AppError('Account email is missing', 400);
     const result = await requestDeleteFilesOtp(email);
@@ -279,20 +307,36 @@ export const requestDeleteFilesOtpHandler = asyncHandler(
 
 export const deleteAllFilesHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
   const body = deleteFilesSchema.parse(req.body);
+  if (!req.workspace?.canManage) {
+    throw new AppError('Only an organization admin can delete files', 403);
+  }
   const user = req.user!;
   if (!user.email) throw new AppError('Account email is missing', 400);
 
   await verifyDeleteFilesOtp(user.email, body.code);
   const result = await deleteAllUserDocuments(user._id.toString(), {
     deleteFolders: body.deleteFolders,
+    orgId: req.workspace.orgId?.toString() ?? null,
   });
   res.json({ ok: true, ...result });
 });
+
+async function assertAdminSuccessor(userId: string) {
+  const orgs = await orgsNeedingSuccessor(userId);
+  if (orgs.length === 0) return;
+  const names = orgs.map((org) => org.name).join(', ');
+  throw new AppError(
+    `Make someone else an admin of ${names} before you delete your account.`,
+    409,
+    { orgs },
+  );
+}
 
 export const requestDeleteAccountOtpHandler = asyncHandler(
   async (req: AuthedRequest, res: Response) => {
     const email = req.user!.email;
     if (!email) throw new AppError('Account email is missing', 400);
+    await assertAdminSuccessor(req.user!._id.toString());
     const result = await requestDeleteAccountOtp(email);
     res.json({
       ok: true,
@@ -311,6 +355,7 @@ export const deleteAccountHandler = asyncHandler(async (req: AuthedRequest, res:
   if (!user.email) throw new AppError('Account email is missing', 400);
 
   await verifyDeleteAccountOtp(user.email, body.code);
+  await assertAdminSuccessor(user._id.toString());
   const scheduled = await scheduleAccountDeletion(user._id.toString());
 
   if (!scheduled.alreadyScheduled) {

@@ -7,6 +7,7 @@ import { AppError } from '../../utils/errors.js';
 import { sendOtpEmail } from '../mail/mailer.js';
 import { signToken } from '../../middleware/auth.js';
 import { cancelAccountDeletion } from '../user/purge.js';
+import { createOrganization, joinOrganization } from '../orgs/workspace.js';
 
 const MAX_ATTEMPTS = 5;
 
@@ -117,8 +118,10 @@ export async function verifyDeleteFilesOtp(email: string, code: string): Promise
 export async function verifyOtp(
   email: string,
   code: string,
+  options?: { orgName?: string; joinSlug?: string },
 ): Promise<{
   token: string;
+  isNew: boolean;
   deletionCancelled: boolean;
   user: {
     id: string;
@@ -132,8 +135,19 @@ export async function verifyOtp(
   await consumeOtp(normalized, code, 'login');
 
   let user = await User.findOne({ email: normalized });
+  const isNew = !user;
   if (!user) {
     user = await User.create({ email: normalized });
+  }
+
+  const orgName = options?.orgName?.trim();
+  const joinSlug = options?.joinSlug?.trim();
+  if (orgName) {
+    await createOrganization(user, orgName);
+    user = (await User.findById(user._id)) ?? user;
+  } else if (joinSlug) {
+    await joinOrganization(user, joinSlug);
+    user = (await User.findById(user._id)) ?? user;
   }
 
   const deletionCancelled = await cancelAccountDeletion(user._id.toString());
@@ -147,6 +161,7 @@ export async function verifyOtp(
 
   return {
     token,
+    isNew,
     deletionCancelled,
     user: {
       id: user._id.toString(),

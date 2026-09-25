@@ -5,6 +5,7 @@ const chunkSchema = new Schema(
   {
     documentId: { type: Schema.Types.ObjectId, ref: 'Document', required: true, index: true },
     userId: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+    orgId: { type: Schema.Types.ObjectId, ref: 'Organization', default: null, index: true },
     content: { type: String, required: true },
     embedding: { type: [Number], required: true },
     pageNumber: { type: Number },

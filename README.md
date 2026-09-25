@@ -1,173 +1,264 @@
-# Knowra API
+# Knowra
 
-Express + TypeScript backend for [Knowra](../Knowra). It authenticates users, stores PDFs, indexes them for search, and answers questions with retrieval-augmented generation (RAG).
+**Ask. Explore. Understand.**
 
-The web app never embeds or chats on its own. This server does that work with the user’s API keys.
+Knowra is a place to keep documents and ask questions about them. Answers come from the files in the workspace you are in, not from the open web.
 
-## What it is responsible for
+You can use Knowra on your own, or inside an organization with other people. The same account can belong to several organizations and switch between them.
 
-- Email one-time-code login and JWT sessions
-- Encrypted storage of provider API keys
-- PDF registration, processing jobs, and deletion
-- Chunk embeddings and Atlas Vector Search
-- Chat across one document or the user’s whole library
-- Usage totals and account purge
+This guide walks through every page. It is the same in the Knowra app and the Knowra API repository.
 
-## RAG pipeline
+## Pages
 
-File intake, chunking, and embeddings are written up in [RAG.md](./RAG.md). The short version:
-
-Indexing and answering are separate. Indexing runs once per upload. Answering runs on every question.
-
-### Indexing
-
-`process_document` jobs in `src/services/jobs/worker.ts`:
-
-1. Download the PDF from Cloudinary.
-2. Extract selectable text with `unpdf` (`src/services/documents/parser.ts`).
-3. If a file has no selectable text, render pages and OCR them with `gpt-4o-mini` (`src/services/documents/ocr.ts`). OCR supports up to 40 pages, two pages at a time.
-4. Split text into chunks of **1,000** characters with **200** characters of overlap. Each chunk keeps its page number.
-5. Embed chunks with OpenAI **`text-embedding-3-small`** (1,536 dimensions), in batches of 64 (`src/services/openai/client.ts`).
-6. Replace any previous chunks for that document and mark it `ready`.
-
-Document status is `uploading`, `processing`, `ready`, or `failed`. Chat only uses `ready` documents that have chunks.
-
-### Answering
-
-`src/services/rag/chat.ts`:
-
-1. Require an OpenAI key. Embeddings always use it, even when chat uses another provider.
-2. Embed the question with the same model used at index time.
-3. Run MongoDB Atlas `$vectorSearch` on the `chunks` collection (cosine similarity). Results are filtered by `userId`, and by `documentId` when a document is selected. The search returns **8** chunks.
-4. If the vector index is unavailable or returns nothing, fall back to recently stored chunks.
-5. Build a context block labeled with document name and page number.
-6. Call the user’s chosen chat model (`src/services/chat/generate.ts`) with a system prompt that limits the answer to that context.
-7. Save the user and assistant messages, including source refs, and return the answer.
-
-Greetings and other short small-talk skip retrieval. A conversation keeps recent messages so follow-up questions have history.
-
-Chat providers: OpenAI, Anthropic, Google Gemini, xAI Grok, and a custom OpenAI-compatible base URL. Temperature is `0.2`.
-
-## Project structure
-
-```
-src/
-  server.ts                     local HTTP server + job worker
-  app.ts                        Express app, CORS, DB, vector index
-  config/
-    env.ts                      environment and RAG constants
-    chatProviders.ts            provider and model catalog
-    db.ts                       MongoDB connection
-  routes/                       HTTP routers
-  controllers/                  request handlers
-  middleware/auth.ts            Bearer JWT check
-  models/                       Mongoose schemas
-  services/
-    rag/chat.ts                 retrieval + prompt + answer
-    rag/ensureVectorIndex.ts    create the Atlas index when possible
-    documents/parser.ts         text extract and chunking
-    documents/ocr.ts            scanned-PDF OCR
-    openai/client.ts            embeddings and vision OCR
-    chat/generate.ts            provider-specific chat calls
-    jobs/worker.ts              background queue
-    cloudinary/storage.ts       PDF upload signatures and downloads
-    auth/otp.ts                 email codes
-    usage/record.ts             daily usage counters
-api/index.ts                    Vercel serverless entry
-atlas-vector-index.json         index definition to create in Atlas
-```
-
-## Data
-
-MongoDB collections:
-
-| Collection | Holds |
-| --- | --- |
-| `users` | Email, profile, encrypted provider keys, deletion schedule |
-| `documents` | PDF metadata, Cloudinary location, status, progress |
-| `chunks` | Passage text, page number, 1,536-d embedding |
-| `conversations` | Chat threads, optional document scope |
-| `messages` | User and assistant turns, plus sources |
-| `jobs` | `process_document`, `delete_document`, `purge_account` |
-| `usagedailies` | Per-day counts of uploads, tokens, chats |
-| `otps` | Login and deletion codes |
-
-Keys are encrypted with `ENCRYPTION_KEY` before they are written. Responses expose only the last four characters.
-
-Every retrieval filter includes `userId`, so one account cannot read another account’s chunks.
-
-## HTTP API
-
-Base path: `/api`. Authenticated routes expect `Authorization: Bearer <jwt>`. Tokens last 7 days.
-
-| Method | Path | Purpose |
+| Page | Who can open it | What it is for |
 | --- | --- | --- |
-| `GET` | `/health` | Liveness |
-| `POST` | `/auth/request-otp` | Email a login code |
-| `POST` | `/auth/verify-otp` | Exchange the code for a JWT |
-| `GET` | `/auth/me` | Current user |
-| `PATCH` | `/auth/me` | Update name |
-| `POST` | `/auth/me/avatar` | Upload avatar |
-| `DELETE` | `/auth/me/avatar` | Remove avatar |
-| `POST` | `/auth/logout` | End the session |
-| `GET` | `/settings` | Keys, chat provider, models |
-| `PUT` | `/settings/openai-key` | Save OpenAI key |
-| `DELETE` | `/settings/openai-key` | Remove OpenAI key |
-| `PUT` | `/settings/chat-prefs` | Provider, model, custom base URL |
-| `PUT` | `/settings/provider-key` | Save Claude, Gemini, Grok, or custom key |
-| `DELETE` | `/settings/provider-key/:provider` | Remove a provider key |
-| `DELETE` | `/settings/chats` | Delete all conversations |
-| `POST` | `/settings/files/request-otp` | Code to delete every file |
-| `DELETE` | `/settings/files` | Delete every file after the code |
-| `POST` | `/settings/account/request-otp` | Code to schedule account deletion |
-| `DELETE` | `/settings/account` | Schedule purge (7-day grace) |
-| `POST` | `/settings/account/cancel` | Cancel a scheduled purge |
-| `GET` | `/documents` | List PDFs (`?q=` filters by name) |
-| `GET` | `/documents/upload-signature` | Cloudinary signature for a direct upload |
-| `POST` | `/documents` | Register an uploaded PDF and enqueue processing |
-| `GET` | `/documents/:id` | One PDF |
-| `GET` | `/documents/:id/file` | Download the stored PDF |
-| `PATCH` | `/documents/:id` | Rename |
-| `DELETE` | `/documents/:id` | Queue deletion of file, chunks, and related chats |
-| `POST` | `/documents/:id/retry` | Re-queue a failed document |
-| `POST` | `/documents/:id/chat` | Chat scoped to one document |
-| `POST` | `/conversations/chat` | Library-wide chat, or scoped when `documentId` is set |
-| `GET` | `/conversations` | List threads |
-| `GET` | `/conversations/:id` | Thread and messages |
-| `DELETE` | `/conversations/:id` | Delete one thread |
-| `GET` | `/usage` | Upload, embedding, OCR, and chat totals |
-| `GET` | `/cron/jobs` | Drain pending jobs (optional `CRON_SECRET`) |
+| Sign in | Everyone signed out | Email code, and for a new account, Personal or Organization |
+| Join | Anyone with an invite link | Join an organization as a member |
+| Workspace | Signed in | Chat, switch workspaces, open chats |
+| Files | Personal, and organization admins | Upload, folders, preview, rename, move, delete |
+| Profile | Signed in | Photo, name, storage, and AI usage |
+| Settings | Signed in | Preferences, organization, AI, data, and account |
 
-The preferred upload path avoids sending the PDF through this server:
+The account menu at the bottom of the sidebar opens **Profile**, **Settings**, and **Log out**.
 
-1. `GET /documents/upload-signature`
-2. Browser `POST`s the file to Cloudinary
-3. `POST /documents` with the Cloudinary `public_id` and URL
+## Sign in
 
-`POST /documents` also accepts a multipart file for local use. Max size defaults to 20 MB. Only PDFs are accepted. An OpenAI key must already be saved.
+Open Knowra and enter your email. A one-time code arrives by email. Enter it to continue. You can resend the code after a short wait. There is no password.
 
-## Background jobs
+![Sign in with an email code](docs/images/sign-in.jpg)
 
-Locally, `src/server.ts` starts a worker that polls every 2 seconds.
+The code screen shows the address it was sent to, a countdown until it expires, **Verify & continue**, **Resend code**, and **Use a different email**.
 
-On Vercel there is no long-running process. New jobs are drained with `waitUntil` after the request, and `GET /api/cron/jobs` can drain up to 10 pending jobs. Set `CRON_SECRET` so that route requires `Authorization: Bearer <CRON_SECRET>`.
+What happens next depends on whether the account already exists.
 
-Failed jobs retry with exponential backoff, up to 5 attempts. A `process_document` job that exhausts its attempts marks the document `failed`.
+- **You have used Knowra before.** You go straight into the app. You are not asked to choose again.
+- **This is a new account.** After the code, Knowra asks how you will use it. This step does not appear on later sign-ins.
 
-`purge_account` runs after the 7-day deletion grace period and removes the user, files, chunks, and chats.
+![Choose Personal or Organization on a new account](docs/images/signup-choice.jpg)
 
-## Atlas Vector Search
+**Personal** opens your own library. Files and AI keys stay yours.
 
-Create an index named `chunk_embedding_index` on the `chunks` collection. The definition is in `atlas-vector-index.json`:
+**Organization** asks for a name. The name must be unique across Knowra, from 2 to 80 characters. You become the admin, and the account is created inside that organization.
 
-- vector field `embedding`, 1536 dimensions, cosine similarity
-- filter fields `userId` and `documentId`
+![Name the organization during signup](docs/images/signup-org.jpg)
 
-On startup the API also tries to ensure this index exists. Atlas still needs vector search enabled on the cluster.
+**Create organization** checks the name and, if it is free, creates it. **Back** returns to the Personal or Organization choice. If the name is already taken, Knowra says so and does not create a second one.
 
-## Setup
+An organization can only be created in that new-account step. It cannot be created later from Settings.
 
-Requirements: Node.js 20+, pnpm, a MongoDB Atlas database, a Cloudinary account, and a way to send email (Resend or SMTP).
+## Join an organization
+
+An admin copies an invite link from **Settings → Organization**. The link looks like `/join/` followed by the organization name.
+
+- **You are signed out.** The page asks for your email and a code. After the code, you join as a member.
+- **You are already signed in.** The page shows a **Join organization** button.
+- **Joining is blocked.** The page says the organization is not accepting new members. Existing members are unchanged.
+- **You were blocked.** The link will not let you back in until an admin unblocks you.
+
+New members can ask questions. They do not get the file library, model choice, or AI keys.
+
+## Workspace
+
+The sidebar is home base.
+
+![Library chat](docs/images/workspace.jpg)
+
+**Workspace switcher.** Opens a list of **Personal** and every organization you belong to. Personal uses your profile photo. An organization uses its logo, or a two-letter mark from its name. The current one is checked. Choosing another reloads that workspace: its files, its chats, and its AI keys.
+
+![Workspace list](docs/images/workspace-switcher.jpg)
+
+**New Chat.** Starts a fresh conversation in the current workspace.
+
+**Files.** Opens the library. Hidden for organization members.
+
+**Chats.** Lists your conversations in this workspace, grouped by day. Search filters them. Each person has their own chats, even inside an organization. Older chats load as you scroll.
+
+**Ask.** The box at the bottom sends a question. **Ask** stays off until there is text, a ready file, and AI is set up. While an answer is on the way, the box locks.
+
+Knowra then shows a live status instead of a blank wait. The label moves through **Searching your files**, **Reading the passages**, **Connecting the details**, and **Drafting an answer**. When the reply arrives, it types in under the Knowra mark and the time.
+
+![Knowra reading the files while an answer is prepared](docs/images/chat-loading.jpg)
+
+The finished reply has **Copy** and **Share**. Copy puts the text on the clipboard. Share opens the device share sheet, or copies the text if the browser cannot share.
+
+Answers come from the ready files in the current workspace. Knowra also knows today’s date, so “next month” uses the real calendar rather than a month mentioned inside a document. Your question and the reply are saved in that chat, so a follow-up stays in the same thread.
+
+The header says how many files are ready. If none are ready, or AI is not set up, chat stays closed and tells you what is missing. Members are told to ask an admin. In Personal, or as an admin, you are sent to **Settings → AI** or to upload a file.
+
+A short note under the transcript says Knowra is an AI and can make mistakes.
+
+On a narrow screen the sidebar opens as a drawer, and you can move between the chat and an open document.
+
+## Files
+
+Admins, and anyone in Personal, manage files here. Organization members are sent back to the workspace.
+
+![The file library](docs/images/files.jpg)
+
+**Upload.** Adds PDFs, Word files, Excel files, and images. An OpenAI key must already be saved, because that key is what reads and indexes the file.
+
+**Upload folder.** Uploads a folder and keeps its structure.
+
+**New folder.** Creates a folder in the current location.
+
+**Search.** Filters files and folders by name.
+
+**Sort.** By name, type, size, status, or date modified, ascending or descending.
+
+**List and grid.** Two ways to look at the same library.
+
+**Open a folder.** Breadcrumbs and back take you through the tree.
+
+**Click a file.** Opens a preview.
+
+**Row menu.**
+
+- **Open** the file.
+- **Rename** the file or folder.
+- **Move** it to another folder.
+- **Delete** it. Deleting a folder removes what is inside it. Deleting a file also removes its search data.
+
+A file moves through uploading and processing until its status is **Ready**. Chat only uses ready files. A failed file stays in the list with an error so you can see what went wrong.
+
+In Personal, files belong to you. In an organization, files belong to the organization. Deleting your account does not delete organization files.
+
+## Profile
+
+Open **Profile** from the account menu, or **Edit profile** in Settings.
+
+![Profile photo](docs/images/profile.jpg)
+
+**Photo.** Shown in the sidebar, chats, and menus. You crop it to a square. JPEG, PNG, WebP, and GIF are accepted, and large images are compressed. **Change photo** replaces it. **Remove** clears it.
+
+**Details.** Display name, up to 80 characters. Leave it blank to use the start of your email. The email itself is your sign-in address and cannot be changed here.
+
+**Usage.** How much space this account is using, split into uploaded files, the search records made from those files, and the total. AI usage shows how your keys were used — uploads, reading scanned pages, embeddings, and chat — for today, this week, or this month. These numbers are for estimating cost. Knowra does not bill you.
+
+## Settings
+
+Settings has five sections. **AI** is hidden while you are only a member of an organization. The other sections stay.
+
+### Preferences
+
+![Preferences](docs/images/preferences.jpg)
+
+**Appearance.** System, Light, or Dark. System follows the device.
+
+**Time format.** 12-hour or 24-hour. A preview shows the current time. Chat timestamps use this.
+
+**Reset.** Restores System appearance and 12-hour time.
+
+These choices stay on this browser.
+
+### Organization
+
+Switch into an organization first if you want to manage it. The logo, invite link, joining control, and people list are only for the organization that is currently open, and only if you are an admin there.
+
+![Organization settings for an admin](docs/images/organization.jpg)
+
+**Logo.** Upload, replace, or remove. It appears in the workspace switcher.
+
+**Invite link.** Copy it and share it. Anyone who uses it joins as a member.
+
+**Block joining / Allow joining.** Blocking stops the link from adding anyone new. People who are already members stay. Allowing turns the link back on.
+
+**Your organizations.** Every organization you belong to, with your role. **Leave** is on each row.
+
+- If another admin is already there, you can leave immediately.
+- If you are the only admin and other people are still in it, the confirmation asks you to choose the next admin. Search that list by name or email. Their photo is shown. They get an email, and then you leave.
+- If you are the only person in it, you can leave without choosing anyone.
+
+Leaving removes your access to that organization’s files and chats. The organization’s files stay.
+
+**Join with an invite.** Paste a link to join another organization without leaving the ones you are already in.
+
+**People.** Admins only, at the bottom of this page. Everyone in the open organization is listed with their photo, name, and email. You are marked **You**. Search filters by name or email. Ten people show at a time, with **Previous** and **Next** when there are more.
+
+![People in the organization](docs/images/people.jpg)
+
+- **Make admin** is on members. It gives that person file, AI, and people access, and emails them that they were made an admin, including who did it.
+- **Remove admin** is on other admins. It turns them back into a member. You cannot remove your own admin access. The organization always keeps at least one admin.
+- **Block** removes their access. They disappear from the workspace switcher and cannot rejoin until you **Unblock** them. A blocked person stays in this list so you can restore them.
+- You cannot block yourself.
+
+Making someone an admin here is the same choice the leave and delete-account flows ask for when you are the only admin.
+
+If you admin several organizations, switch to the one you want to manage. The others stay in **Your organizations** until you do.
+
+Members still see **Your organizations**, **Leave**, and **Join with an invite**. They do not see the logo, invite link, joining control, or people list.
+
+### AI
+
+Shown in Personal, and when you are an admin of the open organization. Hidden for members. Organization keys are stored on the organization, not on your personal account.
+
+![AI settings](docs/images/ai.jpg)
+
+A status line says whether chat is ready.
+
+**1. Documents.** An OpenAI key. Required. It reads scanned pages and builds search. Save it, replace it, or remove it. Only the last four characters are shown after it is saved.
+
+**2. Chat answers.** Pick a provider and a model, then apply.
+
+- **OpenAI** uses the same key as documents.
+- **Claude, Gemini, and Grok** each need their own key.
+- **Custom** is any OpenAI-compatible endpoint. You set the base URL and model. The key can be left blank for a local server.
+
+Keys stay saved when you switch providers. You do not re-enter a Gemini key after using Grok. OpenAI is still required for reading and search even when chat uses another provider.
+
+### Data
+
+![Data settings](docs/images/data.jpg)
+
+**Clear chats.** Deletes every conversation in the current workspace. Files stay. In an organization this clears your chats there, not anyone else’s, and not your personal chats.
+
+**Delete files.** Admins only. Asks for an email code, then removes every file in the current workspace, including nested folders, plus the search data and chats tied to those files. Personal delete does not remove organization files, and organization delete does not remove personal files.
+
+Members see **Clear chats** only.
+
+### Account
+
+**Edit profile.** Opens Profile.
+
+**Sign out.** Ends the session on this browser. You can sign in again with a new code.
+
+**Delete account.** Asks for an email code, then waits 7 days. Sign in again during that window to cancel.
+
+If you are the only admin of an organization that still has other people, you must make someone else an admin before the account can be deleted. If another admin already exists, or you are the only person in the organization, you can delete without that step.
+
+Deleting your account removes your personal files and chats. Organization files, keys, logo, and members stay.
+
+## Who can do what
+
+| | Personal | Organization admin | Organization member |
+| --- | --- | --- | --- |
+| Chat on ready files | Yes | Yes | Yes, with the organization’s keys |
+| See and edit files | Yes | Yes | No |
+| AI keys and model | Your own | The organization’s | No |
+| Invite, logo, people | — | Yes, for the open organization | No |
+| Join or leave organizations | Yes | Yes | Yes |
+| Clear your chats | Yes | Yes | Yes |
+| Delete all files | Yes, personal files | Yes, that organization’s files | No |
+| Delete your account | Yes | Yes, after another admin exists if you are the only one | Yes |
+
+## A short path through the product
+
+1. Sign in with the code from your email.
+2. On a new account, choose Personal or create an organization.
+3. In Personal, or as an organization admin, open **Settings → AI** and save an OpenAI key. Choose a chat provider if you want one.
+4. Upload files and wait until they are **Ready**.
+5. Ask a question in the workspace.
+6. Share the organization invite if other people should be able to ask questions too.
+
+## Run it locally
+
+Knowra is two projects that run together.
+
+| Project | What it is | Usual address |
+| --- | --- | --- |
+| Knowra | The web app | http://localhost:5173 |
+| Knowra-api | The API | http://localhost:4000 |
+
+From each project:
 
 ```bash
 pnpm install
@@ -175,52 +266,4 @@ cp .env.example .env
 pnpm dev
 ```
 
-The server listens on `http://localhost:4000`.
-
-Generate an encryption key (64 hex characters, 32 bytes):
-
-```bash
-node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
-```
-
-### Environment
-
-| Variable | Required | Purpose |
-| --- | --- | --- |
-| `PORT` | | HTTP port. Default `4000`. |
-| `CLIENT_ORIGIN` | | Allowed browser origins, comma-separated. |
-| `MONGODB_URI` | yes | Atlas connection string. |
-| `JWT_SECRET` | yes | Signs session tokens. At least 16 characters. |
-| `ENCRYPTION_KEY` | yes | 64 hex characters. Encrypts stored API keys. |
-| `CLOUDINARY_CLOUD_NAME` | yes for uploads | Cloudinary cloud name. |
-| `CLOUDINARY_API_KEY` | yes for uploads | Cloudinary API key. |
-| `CLOUDINARY_API_SECRET` | yes for uploads | Cloudinary API secret. |
-| `RESEND_API_KEY` | one mail path | Preferred when SMTP ports are blocked. |
-| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM` | one mail path | SMTP fallback for OTP email. |
-| `EMAIL_LOGO_URL` | | Public HTTPS logo for OTP emails. |
-| `CRON_SECRET` | | Protects `/api/cron/jobs` when set. |
-| `NODE_ENV` | | `production` in deployed environments. |
-
-Optional: `OTP_EXPIRY_MINUTES` (10), `OTP_RESEND_COOLDOWN_SECONDS` (60), `MAX_UPLOAD_BYTES` (1073741824), `VECTOR_INDEX_NAME` (`chunk_embedding_index`).
-
-RAG constants in `src/config/env.ts` are fixed: embedding model, chunk size, chunk overlap, and OCR limits. They are not user settings.
-
-## Scripts
-
-| Command | What it does |
-| --- | --- |
-| `pnpm dev` | Start with hot reload (`tsx watch`) |
-| `pnpm build` | Compile TypeScript to `dist/` |
-| `pnpm start` | Run `dist/server.js` |
-| `pnpm typecheck` | Typecheck without emitting files |
-
-## Deploy
-
-The API can run as a long-lived Node process or as a Vercel serverless function (`api/index.ts`).
-
-1. Set the environment variables from `.env.example`.
-2. Set `CLIENT_ORIGIN` to the frontend origin, for example `https://<your-app>.vercel.app`.
-3. Set `NODE_ENV=production`.
-4. In Atlas → Network Access, allow the deployment’s IP addresses.
-5. Create the vector search index described above.
-6. Point the frontend build at `https://<your-api>/api`.
+The app expects the API at `http://localhost:4000/api`. Put your own keys, database, mail, and file storage in the API environment file. Do not commit `.env`.

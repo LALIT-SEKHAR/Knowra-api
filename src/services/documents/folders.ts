@@ -112,8 +112,15 @@ function subtreeHeight(folderId: string, childIds: Map<string, string[]>): numbe
   return 1 + Math.max(...children.map((child) => subtreeHeight(child, childIds)));
 }
 
-async function loadUserFolders(userId: mongoose.Types.ObjectId | string) {
-  return FolderModel.find({ userId });
+type OrgScope = mongoose.Types.ObjectId | null | undefined;
+
+function folderOwner(userId: mongoose.Types.ObjectId | string, orgId?: OrgScope) {
+  if (orgId) return { orgId };
+  return { userId, orgId: null as null };
+}
+
+async function loadUserFolders(userId: mongoose.Types.ObjectId | string, orgId?: OrgScope) {
+  return FolderModel.find(folderOwner(userId, orgId));
 }
 
 function isDuplicateKey(err: unknown): boolean {
@@ -125,9 +132,10 @@ async function assertUniqueSibling(
   parentId: string | null,
   name: string,
   excludeId?: string,
+  orgId?: OrgScope,
 ) {
   const existing = await FolderModel.findOne({
-    userId,
+    ...folderOwner(userId, orgId),
     parentId: parentId ?? null,
     nameKey: folderNameKey(name),
     ...(excludeId ? { _id: { $ne: excludeId } } : {}),
@@ -138,16 +146,21 @@ async function assertUniqueSibling(
 export async function assertFolderOwned(
   userId: mongoose.Types.ObjectId | string,
   folderId: string | null | undefined,
+  orgId?: OrgScope,
 ) {
   if (!folderId) return null;
   if (!mongoose.isValidObjectId(folderId)) throw new AppError('Folder not found', 404);
-  const folder = await FolderModel.findOne({ _id: folderId, userId });
+  const folder = await FolderModel.findOne({ _id: folderId, ...folderOwner(userId, orgId) });
   if (!folder) throw new AppError('Folder not found', 404);
   return folder;
 }
 
-export async function resolveBrowse(userId: mongoose.Types.ObjectId, folderParam: string) {
-  const folders = await loadUserFolders(userId);
+export async function resolveBrowse(
+  userId: mongoose.Types.ObjectId,
+  folderParam: string,
+  orgId?: OrgScope,
+) {
+  const folders = await loadUserFolders(userId, orgId);
   const index = buildFolderIndex(folders);
   if (folderParam === 'root') {
     return { folders, ...index, currentId: null as string | null };
@@ -162,9 +175,10 @@ export async function createUserFolder(
   userId: mongoose.Types.ObjectId,
   name: string,
   parentId: string | null,
+  orgId?: OrgScope,
 ): Promise<FolderDocument> {
   const clean = normalizeFolderName(name);
-  const folders = await loadUserFolders(userId);
+  const folders = await loadUserFolders(userId, orgId);
   const { byId } = buildFolderIndex(folders);
   if (parentId) {
     if (!mongoose.isValidObjectId(parentId) || !byId.has(parentId)) {
@@ -174,10 +188,11 @@ export async function createUserFolder(
       throw new AppError(`Folders can only be nested ${MAX_FOLDER_DEPTH} levels deep`, 400);
     }
   }
-  await assertUniqueSibling(userId, parentId, clean);
+  await assertUniqueSibling(userId, parentId, clean, undefined, orgId);
   try {
     return await FolderModel.create({
       userId,
+      orgId: orgId ?? null,
       name: clean,
       nameKey: folderNameKey(clean),
       parentId: parentId ? new mongoose.Types.ObjectId(parentId) : null,
@@ -192,6 +207,7 @@ export async function ensureFolderPath(
   userId: mongoose.Types.ObjectId,
   parentId: string | null,
   segments: string[],
+  orgId?: OrgScope,
 ): Promise<FolderDocument> {
   if (segments.length < 1 || segments.length > MAX_FOLDER_DEPTH) {
     throw new AppError(`Folder paths can be at most ${MAX_FOLDER_DEPTH} levels deep`, 400);
@@ -201,7 +217,7 @@ export async function ensureFolderPath(
   for (const segment of segments) {
     const clean = normalizeFolderName(segment);
     const existing = await FolderModel.findOne({
-      userId,
+      ...folderOwner(userId, orgId),
       parentId: currentParent ?? null,
       nameKey: folderNameKey(clean),
     });
@@ -211,11 +227,11 @@ export async function ensureFolderPath(
       continue;
     }
     try {
-      leaf = await createUserFolder(userId, clean, currentParent);
+      leaf = await createUserFolder(userId, clean, currentParent, orgId);
     } catch (err) {
       if (!(err instanceof AppError) || err.statusCode !== 409) throw err;
       const raced = await FolderModel.findOne({
-        userId,
+        ...folderOwner(userId, orgId),
         parentId: currentParent ?? null,
         nameKey: folderNameKey(clean),
       });
@@ -232,12 +248,13 @@ export async function updateUserFolder(
   userId: mongoose.Types.ObjectId,
   folderId: string,
   patch: { name?: string; parentId?: string | null },
+  orgId?: OrgScope,
 ): Promise<FolderDocument> {
   if (!mongoose.isValidObjectId(folderId)) throw new AppError('Folder not found', 404);
-  const folder = await FolderModel.findOne({ _id: folderId, userId });
+  const folder = await FolderModel.findOne({ _id: folderId, ...folderOwner(userId, orgId) });
   if (!folder) throw new AppError('Folder not found', 404);
 
-  const folders = await loadUserFolders(userId);
+  const folders = await loadUserFolders(userId, orgId);
   const { byId, childIds } = buildFolderIndex(folders);
   let nextParent = folder.parentId ? folder.parentId.toString() : null;
 
@@ -261,7 +278,7 @@ export async function updateUserFolder(
 
   const nextName = patch.name !== undefined ? normalizeFolderName(patch.name) : folder.name;
   if (nextName !== folder.name || nextParent !== (folder.parentId ? folder.parentId.toString() : null)) {
-    await assertUniqueSibling(userId, nextParent, nextName, folderId);
+    await assertUniqueSibling(userId, nextParent, nextName, folderId, orgId);
   }
 
   folder.name = nextName;
@@ -276,19 +293,24 @@ export async function updateUserFolder(
   return folder;
 }
 
-export async function deleteUserFolder(userId: mongoose.Types.ObjectId, folderId: string) {
+export async function deleteUserFolder(
+  userId: mongoose.Types.ObjectId,
+  folderId: string,
+  orgId?: OrgScope,
+) {
   if (!mongoose.isValidObjectId(folderId)) throw new AppError('Folder not found', 404);
-  const folders = await loadUserFolders(userId);
+  const folders = await loadUserFolders(userId, orgId);
   const { byId, childIds } = buildFolderIndex(folders);
   if (!byId.has(folderId)) throw new AppError('Folder not found', 404);
 
   const ids = [folderId, ...descendantIds(folderId, childIds)];
   const objectIds = ids.map((id) => new mongoose.Types.ObjectId(id));
-  const docs = await DocumentModel.find({ userId, folderId: { $in: objectIds } });
+  const owner = folderOwner(userId, orgId);
+  const docs = await DocumentModel.find({ ...owner, folderId: { $in: objectIds } });
 
   if (docs.length > 0) {
     await DocumentModel.updateMany(
-      { userId, _id: { $in: docs.map((doc) => doc._id) } },
+      { ...owner, _id: { $in: docs.map((doc) => doc._id) } },
       { status: 'processing' },
     );
     for (const doc of docs) {
@@ -301,6 +323,6 @@ export async function deleteUserFolder(userId: mongoose.Types.ObjectId, folderId
     }
   }
 
-  await FolderModel.deleteMany({ userId, _id: { $in: objectIds } });
+  await FolderModel.deleteMany({ ...owner, _id: { $in: objectIds } });
   return { deletedFolders: ids.length, deletedDocuments: docs.length };
 }

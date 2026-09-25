@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import authRoutes from './auth.js';
+import orgRoutes from './orgs.js';
 import settingsRoutes from './settings.js';
 import documentsRoutes from './documents.js';
 import conversationsRoutes from './conversations.js';
@@ -13,6 +14,7 @@ router.get('/health', (_req, res) => {
 });
 
 router.use('/auth', authRoutes);
+router.use('/orgs', orgRoutes);
 router.use('/settings', settingsRoutes);
 router.use('/documents', documentsRoutes);
 router.use('/conversations', conversationsRoutes);

@@ -26,6 +26,9 @@ const userSchema = new Schema(
     /** OpenAI-compatible base URL for custom chat, e.g. https://api.groq.com/openai/v1 */
     customBaseUrl: { type: String },
 
+    /** Null means the personal workspace. Set when the user is inside an organization. */
+    activeOrgId: { type: Schema.Types.ObjectId, ref: 'Organization', default: null },
+
     lastLoginAt: { type: Date },
     deletionRequestedAt: { type: Date },
     deletionScheduledFor: { type: Date, index: true },

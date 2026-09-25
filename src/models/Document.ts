@@ -6,6 +6,8 @@ export type DocumentStatus = (typeof DOCUMENT_STATUSES)[number];
 const documentSchema = new Schema(
   {
     userId: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+    /** Null for a personal library. Set when the file belongs to an organization. */
+    orgId: { type: Schema.Types.ObjectId, ref: 'Organization', default: null, index: true },
     name: { type: String, required: true, trim: true },
     mimeType: { type: String, required: true },
     size: { type: Number, required: true },

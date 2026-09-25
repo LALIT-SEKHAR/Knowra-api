@@ -5,8 +5,13 @@ import { Conversation, type ConversationDocument } from '../../models/Conversati
 import { Message } from '../../models/Message.js';
 import { DocumentModel } from '../../models/Document.js';
 import { User } from '../../models/User.js';
+import type { OrganizationDocument } from '../../models/Organization.js';
 import { decryptSecret } from '../../utils/crypto.js';
 import { AppError } from '../../utils/errors.js';
+import {
+  libraryFilter,
+  type Workspace,
+} from '../orgs/workspace.js';
 import {
   resolveChatSelection,
   type ChatProviderId,
@@ -28,13 +33,17 @@ type RetrievedChunk = {
   documentId: mongoose.Types.ObjectId;
   content: string;
   pageNumber?: number;
+  orgId?: mongoose.Types.ObjectId | null;
   score?: number;
   documentName?: string;
 };
 
-async function getReadyDocumentIds(userId: string): Promise<mongoose.Types.ObjectId[]> {
+async function getReadyDocumentIds(
+  userId: string,
+  workspace: Workspace,
+): Promise<mongoose.Types.ObjectId[]> {
   const docs = await DocumentModel.find({
-    userId: new mongoose.Types.ObjectId(userId),
+    ...libraryFilter(workspace, new mongoose.Types.ObjectId(userId)),
     status: 'ready',
   }).select('_id');
   return docs.map((d) => d._id);
@@ -43,12 +52,13 @@ async function getReadyDocumentIds(userId: string): Promise<mongoose.Types.Objec
 async function loadChunksFallback(
   userId: string,
   documentIds: mongoose.Types.ObjectId[],
+  workspace: Workspace,
   limit = 8,
 ): Promise<RetrievedChunk[]> {
   if (documentIds.length === 0) return [];
 
   const fallback = await Chunk.find({
-    userId: new mongoose.Types.ObjectId(userId),
+    ...libraryFilter(workspace, new mongoose.Types.ObjectId(userId)),
     documentId: { $in: documentIds },
   })
     .sort({ createdAt: -1 })
@@ -67,11 +77,15 @@ async function vectorSearch(
   userId: string,
   documentIds: mongoose.Types.ObjectId[] | null,
   queryEmbedding: number[],
+  workspace: Workspace,
   limit = 8,
 ): Promise<RetrievedChunk[]> {
-  const filter: Record<string, unknown> = {
-    userId: { $eq: new mongoose.Types.ObjectId(userId) },
-  };
+  const filter: Record<string, unknown> = {};
+  if (workspace.orgId) {
+    filter.orgId = { $eq: workspace.orgId };
+  } else {
+    filter.userId = { $eq: new mongoose.Types.ObjectId(userId) };
+  }
   if (documentIds) {
     if (documentIds.length === 1) {
       filter.documentId = { $eq: documentIds[0] };
@@ -99,13 +113,17 @@ async function vectorSearch(
           content: 1,
           pageNumber: 1,
           documentId: 1,
+          orgId: 1,
           score: { $meta: 'vectorSearchScore' },
         },
       },
     ]);
 
     if (results.length > 0) {
-      return results;
+      const scoped = workspace.orgId
+        ? results.filter((chunk) => chunk.orgId?.toString() === workspace.orgId?.toString())
+        : results.filter((chunk) => !chunk.orgId);
+      if (scoped.length > 0) return scoped;
     }
 
     console.warn(
@@ -115,7 +133,7 @@ async function vectorSearch(
     console.warn('Vector search unavailable, falling back to stored chunks', err);
   }
 
-  return loadChunksFallback(userId, documentIds ?? (await getReadyDocumentIds(userId)), limit);
+  return loadChunksFallback(userId, documentIds ?? (await getReadyDocumentIds(userId, workspace)), workspace, limit);
 }
 
 async function attachDocumentNames(chunks: RetrievedChunk[]): Promise<RetrievedChunk[]> {
@@ -236,9 +254,34 @@ async function lockConversationTitleOnce(params: {
   }
 }
 
+function calendarHint(now = new Date()): string {
+  const date = now.toLocaleDateString('en-GB', {
+    weekday: 'long',
+    day: 'numeric',
+    month: 'long',
+    year: 'numeric',
+    timeZone: 'Asia/Kolkata',
+  });
+  const thisMonth = now.toLocaleDateString('en-GB', {
+    month: 'long',
+    year: 'numeric',
+    timeZone: 'Asia/Kolkata',
+  });
+  const next = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+  next.setMonth(next.getMonth() + 1, 1);
+  const nextMonth = next.toLocaleDateString('en-GB', {
+    month: 'long',
+    year: 'numeric',
+    timeZone: 'Asia/Kolkata',
+  });
+  return `Today is ${date}. This month is ${thisMonth}. Next month is ${nextMonth}.`;
+}
+
 function buildSystemPrompt(scope: 'library' | 'document'): string {
   const shared = [
     'You are Knowra, a friendly AI assistant that helps users explore their uploaded documents.',
+    calendarHint(),
+    'When the user says today, tomorrow, this month, next month, or another relative time, use that date. Do not pick a month from the documents.',
     'For greetings, thanks, or small talk, reply briefly and warmly. Offer to help with their documents.',
     'For questions about your capabilities, explain that you can search and answer from their uploaded PDFs.',
     'For document questions, use ONLY the provided document context. Do not invent page numbers, document names, or facts.',
@@ -290,17 +333,32 @@ type ChatAccess = {
   customBaseUrl?: string | null;
 };
 
-async function requireChatAccess(userId: string): Promise<ChatAccess> {
-  const user = await User.findById(userId);
-  if (!user?.openaiApiKeyEncrypted) {
+type KeySource = {
+  openaiApiKeyEncrypted?: string | null;
+  chatProvider?: string | null;
+  chatModel?: string | null;
+  anthropicApiKeyEncrypted?: string | null;
+  googleApiKeyEncrypted?: string | null;
+  xaiApiKeyEncrypted?: string | null;
+  customApiKeyEncrypted?: string | null;
+  customBaseUrl?: string | null;
+};
+
+async function requireChatAccess(userId: string, workspace: Workspace): Promise<ChatAccess> {
+  const source: KeySource | OrganizationDocument | null = workspace.org
+    ? workspace.org
+    : await User.findById(userId);
+  if (!source?.openaiApiKeyEncrypted) {
     throw new AppError(
-      'Add your OpenAI API key in Settings → AI (needed to search your documents)',
+      workspace.org
+        ? 'Your organization admin needs to add an OpenAI API key in Settings → AI'
+        : 'Add your OpenAI API key in Settings → AI (needed to search your documents)',
       400,
     );
   }
 
-  const { provider, model } = resolveChatSelection(user.chatProvider, user.chatModel);
-  const openaiApiKey = decryptSecret(user.openaiApiKeyEncrypted);
+  const { provider, model } = resolveChatSelection(source.chatProvider, source.chatModel);
+  const openaiApiKey = decryptSecret(source.openaiApiKeyEncrypted);
 
   if (provider === 'openai') {
     return {
@@ -312,44 +370,61 @@ async function requireChatAccess(userId: string): Promise<ChatAccess> {
   }
 
   if (provider === 'anthropic') {
-    if (!user.anthropicApiKeyEncrypted) {
-      throw new AppError('Add your Anthropic API key in Settings → AI for Claude chat', 400);
+    if (!source.anthropicApiKeyEncrypted) {
+      throw new AppError(
+        workspace.org
+          ? 'Your organization admin needs to add an Anthropic API key for Claude chat'
+          : 'Add your Anthropic API key in Settings → AI for Claude chat',
+        400,
+      );
     }
     return {
       openaiApiKey,
       chatProvider: provider,
       chatModel: model,
-      chatApiKey: decryptSecret(user.anthropicApiKeyEncrypted),
+      chatApiKey: decryptSecret(source.anthropicApiKeyEncrypted),
     };
   }
 
   if (provider === 'google') {
-    if (!user.googleApiKeyEncrypted) {
-      throw new AppError('Add your Google AI API key in Settings → AI for Gemini chat', 400);
+    if (!source.googleApiKeyEncrypted) {
+      throw new AppError(
+        workspace.org
+          ? 'Your organization admin needs to add a Google AI API key for Gemini chat'
+          : 'Add your Google AI API key in Settings → AI for Gemini chat',
+        400,
+      );
     }
     return {
       openaiApiKey,
       chatProvider: provider,
       chatModel: model,
-      chatApiKey: decryptSecret(user.googleApiKeyEncrypted),
+      chatApiKey: decryptSecret(source.googleApiKeyEncrypted),
     };
   }
 
   if (provider === 'xai') {
-    if (!user.xaiApiKeyEncrypted) {
-      throw new AppError('Add your xAI API key in Settings → AI for Grok chat', 400);
+    if (!source.xaiApiKeyEncrypted) {
+      throw new AppError(
+        workspace.org
+          ? 'Your organization admin needs to add an xAI API key for Grok chat'
+          : 'Add your xAI API key in Settings → AI for Grok chat',
+        400,
+      );
     }
     return {
       openaiApiKey,
       chatProvider: provider,
       chatModel: model,
-      chatApiKey: decryptSecret(user.xaiApiKeyEncrypted),
+      chatApiKey: decryptSecret(source.xaiApiKeyEncrypted),
     };
   }
 
-  if (!user.customBaseUrl?.trim()) {
+  if (!source.customBaseUrl?.trim()) {
     throw new AppError(
-      'Add your custom API base URL in Settings → AI before chatting',
+      workspace.org
+        ? 'Your organization admin needs to add a custom API base URL before chatting'
+        : 'Add your custom API base URL in Settings → AI before chatting',
       400,
     );
   }
@@ -358,10 +433,10 @@ async function requireChatAccess(userId: string): Promise<ChatAccess> {
     openaiApiKey,
     chatProvider: 'custom',
     chatModel: model,
-    chatApiKey: user.customApiKeyEncrypted
-      ? decryptSecret(user.customApiKeyEncrypted)
+    chatApiKey: source.customApiKeyEncrypted
+      ? decryptSecret(source.customApiKeyEncrypted)
       : 'not-needed',
-    customBaseUrl: user.customBaseUrl,
+    customBaseUrl: source.customBaseUrl,
   };
 }
 
@@ -370,12 +445,13 @@ async function runChat(params: {
   question: string;
   conversationId?: string;
   documentId?: string;
+  workspace: Workspace;
 }): Promise<{
   answer: string;
   sources: SourceRef[];
   conversationId: string;
 }> {
-  const access = await requireChatAccess(params.userId);
+  const access = await requireChatAccess(params.userId, params.workspace);
   const { openaiApiKey, chatProvider, chatModel, chatApiKey, customBaseUrl } = access;
   const casual = isCasualMessage(params.question);
 
@@ -386,7 +462,7 @@ async function runChat(params: {
     if (params.documentId) {
       const document = await DocumentModel.findOne({
         _id: params.documentId,
-        userId: params.userId,
+        ...libraryFilter(params.workspace, new mongoose.Types.ObjectId(params.userId)),
       });
       if (!document) {
         throw new AppError('Document not found', 404);
@@ -397,7 +473,7 @@ async function runChat(params: {
       documentIds = [document._id];
       scope = 'document';
     } else {
-      const readyIds = await getReadyDocumentIds(params.userId);
+      const readyIds = await getReadyDocumentIds(params.userId, params.workspace);
       if (readyIds.length === 0) {
         throw new AppError('Upload and process at least one PDF before chatting.', 400);
       }
@@ -405,9 +481,10 @@ async function runChat(params: {
       documentIds = null;
     }
 
+    const owner = libraryFilter(params.workspace, new mongoose.Types.ObjectId(params.userId));
     const chunkFilter = documentIds
-      ? { userId: params.userId, documentId: documentIds[0] }
-      : { userId: params.userId };
+      ? { ...owner, documentId: documentIds[0] }
+      : owner;
 
     const chunkCount = await Chunk.countDocuments(chunkFilter);
     if (chunkCount === 0) {
@@ -425,12 +502,14 @@ async function runChat(params: {
     ? await Conversation.findOne({
         _id: params.conversationId,
         userId: params.userId,
+        orgId: params.workspace.orgId,
       })
     : null;
 
   if (!conversation) {
     conversation = await Conversation.create({
       userId: params.userId,
+      orgId: params.workspace.orgId,
       documentId: params.documentId || undefined,
       title: params.question.slice(0, 80),
     });
@@ -496,11 +575,15 @@ async function runChat(params: {
     };
   }
 
-  const queryEmbedding = await createEmbedding(openaiApiKey, params.question);
+  const queryEmbedding = await createEmbedding(
+    openaiApiKey,
+    `${params.question}\n${calendarHint()}`,
+  );
   const retrievedRaw = await vectorSearch(
     params.userId,
     scope === 'library' ? null : documentIds,
     queryEmbedding.embedding,
+    params.workspace,
   );
   const retrieved = await attachDocumentNames(retrievedRaw);
 
@@ -583,6 +666,7 @@ export async function chatWithDocument(params: {
   documentId: string;
   question: string;
   conversationId?: string;
+  workspace: Workspace;
 }) {
   return runChat(params);
 }
@@ -592,6 +676,7 @@ export async function chatAcrossLibrary(params: {
   question: string;
   conversationId?: string;
   documentId?: string;
+  workspace: Workspace;
 }) {
   return runChat(params);
 }

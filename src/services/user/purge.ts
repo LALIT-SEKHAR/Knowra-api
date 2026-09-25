@@ -7,6 +7,8 @@ import { Message } from '../../models/Message.js';
 import { Otp } from '../../models/Otp.js';
 import { UsageDaily } from '../../models/UsageDaily.js';
 import { User } from '../../models/User.js';
+import { Membership } from '../../models/Membership.js';
+import { orgsNeedingSuccessor } from '../orgs/workspace.js';
 import { ACCOUNT_DELETION_GRACE_DAYS } from '../../config/env.js';
 import { AppError } from '../../utils/errors.js';
 import {
@@ -15,8 +17,14 @@ import {
   deleteCloudinaryImage,
 } from '../cloudinary/storage.js';
 
-export async function clearUserChatHistory(userId: string): Promise<{ deletedConversations: number }> {
-  const conversations = await Conversation.find({ userId }).select('_id');
+export async function clearUserChatHistory(
+  userId: string,
+  orgId: string | null = null,
+): Promise<{ deletedConversations: number }> {
+  const conversations = await Conversation.find({
+    userId,
+    orgId: orgId ? orgId : null,
+  }).select('_id');
   const ids = conversations.map((c) => c._id);
   if (ids.length > 0) {
     await Message.deleteMany({ conversationId: { $in: ids } });
@@ -27,9 +35,12 @@ export async function clearUserChatHistory(userId: string): Promise<{ deletedCon
 
 export async function deleteAllUserDocuments(
   userId: string,
-  options: { deleteFolders?: boolean } = {},
+  options: { deleteFolders?: boolean; orgId?: string | null } = {},
 ): Promise<{ deletedDocuments: number; deletedFolders: number }> {
-  const documents = await DocumentModel.find({ userId }).select(
+  const owner = options.orgId
+    ? { orgId: options.orgId }
+    : { userId, orgId: null };
+  const documents = await DocumentModel.find(owner).select(
     '_id cloudinaryPublicId cloudinaryParts',
   );
   const documentIds = documents.map((d) => d._id);
@@ -45,7 +56,7 @@ export async function deleteAllUserDocuments(
   }
 
   if (documentIds.length > 0) {
-    await Chunk.deleteMany({ userId, documentId: { $in: documentIds } });
+    await Chunk.deleteMany({ ...owner, documentId: { $in: documentIds } });
 
     const scopedConversations = await Conversation.find({
       userId,
@@ -57,12 +68,12 @@ export async function deleteAllUserDocuments(
       await Conversation.deleteMany({ _id: { $in: conversationIds }, userId });
     }
 
-    await DocumentModel.deleteMany({ userId, _id: { $in: documentIds } });
+    await DocumentModel.deleteMany({ ...owner, _id: { $in: documentIds } });
   }
 
   let deletedFolders = 0;
   if (options.deleteFolders) {
-    const folderResult = await FolderModel.deleteMany({ userId });
+    const folderResult = await FolderModel.deleteMany(owner);
     deletedFolders = folderResult.deletedCount ?? 0;
   }
 
@@ -74,12 +85,23 @@ export async function deleteAllUserDocuments(
   return { deletedDocuments: documentIds.length, deletedFolders };
 }
 
-/** Full wipe of every record tied to this user (DB + Cloudinary). */
+/** Drop this user's memberships. A sole admin must appoint someone else before deletion. */
+async function releaseOrganizationAdmin(userId: string): Promise<void> {
+  await Membership.deleteMany({ userId });
+}
+
+/** Full wipe of this user's personal records. Organization files, keys, and members stay. */
 export async function purgeUserDataCompletely(userId: string): Promise<void> {
   const user = await User.findById(userId);
   if (!user) return;
 
   const email = user.email?.toLowerCase();
+  const blocked = await orgsNeedingSuccessor(userId);
+  if (blocked.length > 0) {
+    await cancelAccountDeletion(userId);
+    return;
+  }
+  const personal = { userId, orgId: null };
 
   const conversations = await Conversation.find({ userId }).select('_id');
   const conversationIds = conversations.map((c) => c._id);
@@ -88,7 +110,7 @@ export async function purgeUserDataCompletely(userId: string): Promise<void> {
   }
   await Conversation.deleteMany({ userId });
 
-  const documents = await DocumentModel.find({ userId }).select(
+  const documents = await DocumentModel.find(personal).select(
     '_id cloudinaryPublicId cloudinaryParts',
   );
   for (const doc of documents) {
@@ -100,11 +122,12 @@ export async function purgeUserDataCompletely(userId: string): Promise<void> {
       }
     }
   }
-  await Chunk.deleteMany({ userId });
-  await DocumentModel.deleteMany({ userId });
-  await FolderModel.deleteMany({ userId });
+  await Chunk.deleteMany(personal);
+  await DocumentModel.deleteMany(personal);
+  await FolderModel.deleteMany(personal);
   await Job.deleteMany({ 'payload.userId': userId });
   await UsageDaily.deleteMany({ userId });
+  await releaseOrganizationAdmin(userId);
 
   if (user.avatarPublicId) {
     try {
