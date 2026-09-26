@@ -5,8 +5,13 @@ import {
 import { AppError } from '../../utils/errors.js';
 import { createOpenAIClient, estimateTokens, withRateLimitRetry, type TokenUsage } from '../openai/client.js';
 
-/** High enough that the same question is phrased differently, low enough to stay accurate. */
-const CHAT_TEMPERATURE = 0.8;
+/**
+ * GPT-5 and o-series reject max_tokens. Dated snapshots count too.
+ * Every chat model uses the provider default temperature — several reject any other value.
+ */
+function modelRejectsMaxTokens(model: string): boolean {
+  return /^(gpt-5|o\d)([\-.]|$)/i.test(model.trim());
+}
 
 export type ChatMessage = {
   role: 'user' | 'assistant' | 'system';
@@ -21,7 +26,6 @@ export type ChatGenerationParams = {
   apiKey: string;
   /** Required for custom provider */
   baseUrl?: string | null;
-  temperature?: number;
   maxTokens?: number;
 };
 
@@ -67,12 +71,17 @@ async function generateOpenAICompatible(
   baseURL?: string,
 ): Promise<ChatGenerationResult> {
   const client = createOpenAIClient(params.apiKey, baseURL);
+  const rejectsMaxTokens = modelRejectsMaxTokens(params.model);
+
   try {
     const response = await withRateLimitRetry(() =>
       client.chat.completions.create({
         model: params.model,
-        temperature: params.temperature ?? CHAT_TEMPERATURE,
-        ...(params.maxTokens ? { max_tokens: params.maxTokens } : {}),
+        ...(params.maxTokens
+          ? rejectsMaxTokens
+            ? { max_completion_tokens: params.maxTokens }
+            : { max_tokens: params.maxTokens }
+          : {}),
         messages: [{ role: 'system', content: params.system }, ...params.messages],
       }),
     );
@@ -135,7 +144,6 @@ async function generateAnthropic(params: ChatGenerationParams): Promise<ChatGene
     body: JSON.stringify({
       model: params.model,
       max_tokens: params.maxTokens ?? 2048,
-      temperature: params.temperature ?? CHAT_TEMPERATURE,
       system: params.system,
       messages: history.length > 0 ? history : [{ role: 'user', content: 'Hello' }],
     }),
@@ -188,10 +196,9 @@ async function generateGemini(params: ChatGenerationParams): Promise<ChatGenerat
     body: JSON.stringify({
       systemInstruction: { parts: [{ text: params.system }] },
       contents,
-      generationConfig: {
-        temperature: params.temperature ?? CHAT_TEMPERATURE,
-        ...(params.maxTokens ? { maxOutputTokens: params.maxTokens } : {}),
-      },
+      ...(params.maxTokens
+        ? { generationConfig: { maxOutputTokens: params.maxTokens } }
+        : {}),
     }),
   });
 

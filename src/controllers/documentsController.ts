@@ -32,6 +32,7 @@ import { enqueueJob } from '../services/jobs/worker.js';
 import { chatWithDocument } from '../services/rag/chat.js';
 import { recordUsage } from '../services/usage/record.js';
 import { libraryFilter } from '../services/orgs/workspace.js';
+import { assertCanProcessDocuments } from '../services/documents/access.js';
 
 function owned(req: AuthedRequest) {
   return libraryFilter(req.workspace!, req.user!._id);
@@ -185,9 +186,7 @@ export const getDocumentHandler = asyncHandler(async (req: AuthedRequest, res: R
 export const uploadSignatureHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
   const user = req.user!;
   const keys = req.workspace?.org ?? user;
-  if (!keys.openaiApiKeyEncrypted) {
-    throw new AppError('Add your OpenAI API key in Settings before uploading', 400);
-  }
+  assertCanProcessDocuments(keys);
 
   const filename =
     typeof req.query.filename === 'string' ? req.query.filename.trim() : '';
@@ -239,9 +238,7 @@ const abortUploadSchema = z.object({
 export const uploadDocumentHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
   const user = req.user!;
   const keys = req.workspace?.org ?? user;
-  if (!keys.openaiApiKeyEncrypted) {
-    throw new AppError('Add your OpenAI API key in Settings before uploading', 400);
-  }
+  assertCanProcessDocuments(keys);
 
   // Preferred path: file already on Cloudinary (avoids serverless body limits).
   if (!req.file) {
@@ -395,9 +392,7 @@ export const retryDocumentHandler = asyncHandler(async (req: AuthedRequest, res:
   }
 
   const keys = req.workspace?.org ?? req.user!;
-  if (!keys.openaiApiKeyEncrypted) {
-    throw new AppError('Add your OpenAI API key in Settings first', 400);
-  }
+  assertCanProcessDocuments(keys);
 
   doc.status = 'processing';
   doc.errorMessage = undefined;

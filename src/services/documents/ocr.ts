@@ -1,9 +1,18 @@
 import { createCanvas, loadImage } from '@napi-rs/canvas';
 import { getDocumentProxy, renderPageAsImage } from 'unpdf';
 import { OCR_CONCURRENCY, OCR_MAX_PAGES } from '../../config/env.js';
-import { extractTextFromImage, type TokenUsage } from '../openai/client.js';
+import type { DocumentProviderId } from '../../config/documentProviders.js';
+import { geminiExtractText } from '../google/gemini.js';
+import { extractTextFromImage, OCR_PROMPT, type TokenUsage } from '../openai/client.js';
 import { assertImageBytes } from './fileTypes.js';
 import { cleanText, type PageText } from './parser.js';
+
+export type PageVision = {
+  provider: DocumentProviderId;
+  apiKey: string;
+  model: string;
+  baseURL?: string;
+};
 
 export type OcrProgress = {
   completedPages: number;
@@ -20,13 +29,23 @@ function emptyUsage(): TokenUsage {
   return { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
 }
 
+async function readPageImage(vision: PageVision, dataUrl: string) {
+  if (vision.provider === 'google') {
+    return geminiExtractText(vision.apiKey, vision.model, dataUrl, OCR_PROMPT);
+  }
+  return extractTextFromImage(vision.apiKey, dataUrl, {
+    model: vision.model,
+    baseURL: vision.baseURL,
+  });
+}
+
 /**
  * OCR fallback for scanned / image-only PDFs.
- * Renders each page and extracts text via the user's OpenAI vision model.
+ * Renders each page and extracts text with the workspace document provider.
  */
 export async function ocrPdfPages(
   buffer: Buffer,
-  apiKey: string,
+  vision: PageVision,
   onProgress?: (progress: OcrProgress) => void | Promise<void>,
 ): Promise<OcrPagesResult> {
   if (!buffer?.length) {
@@ -58,7 +77,7 @@ export async function ocrPdfPages(
         toDataURL: true,
       });
 
-      const result = await extractTextFromImage(apiKey, dataUrl);
+      const result = await readPageImage(vision, dataUrl);
       usage = {
         promptTokens: usage.promptTokens + result.usage.promptTokens,
         completionTokens: usage.completionTokens + result.usage.completionTokens,
@@ -90,7 +109,7 @@ const OCR_IMAGE_MAX_EDGE = 2048;
 /** Read a single uploaded image. Large photos are scaled down before OCR. */
 export async function ocrStandaloneImage(
   buffer: Buffer,
-  apiKey: string,
+  vision: PageVision,
 ): Promise<OcrPagesResult> {
   assertImageBytes(buffer);
   const image = await loadImage(buffer);
@@ -104,7 +123,7 @@ export async function ocrStandaloneImage(
   const canvas = createCanvas(width, height);
   canvas.getContext('2d').drawImage(image, 0, 0, width, height);
   const dataUrl = canvas.toDataURL('image/jpeg', 80);
-  const result = await extractTextFromImage(apiKey, dataUrl);
+  const result = await readPageImage(vision, dataUrl);
   const cleaned = cleanText(result.text);
 
   return {

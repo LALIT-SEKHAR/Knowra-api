@@ -14,6 +14,10 @@ const organizationSchema = new Schema(
 
     openaiApiKeyEncrypted: { type: String },
     openaiKeyLast4: { type: String },
+    /** Who reads files and builds embeddings. Claude and Grok are not valid here. */
+    documentProvider: { type: String, default: 'openai' },
+    /** Vision model for Custom documents. OpenAI and Gemini use fixed defaults. */
+    documentModel: { type: String },
     chatProvider: { type: String, default: 'openai' },
     chatModel: { type: String, default: 'gpt-4o-mini' },
     anthropicApiKeyEncrypted: { type: String },

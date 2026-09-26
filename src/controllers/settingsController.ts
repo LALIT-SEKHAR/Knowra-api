@@ -16,6 +16,10 @@ import type { UserDocument } from '../models/User.js';
 import { User } from '../models/User.js';
 import { validateOpenAIKey } from '../services/openai/client.js';
 import { validateChatProviderKey } from '../services/chat/generate.js';
+import { chatKeyReady, documentKeyReady, workspaceCanChat } from '../services/documents/access.js';
+import { applyDocumentProvider, previewDocumentRebuild } from '../services/documents/reindex.js';
+import { resolveDocumentProvider } from '../config/documentProviders.js';
+import { libraryFilter } from '../services/orgs/workspace.js';
 import {
   requestDeleteAccountOtp,
   requestDeleteFilesOtp,
@@ -61,19 +65,18 @@ const deleteFilesSchema = z.object({
 });
 
 function hasChatProviderKey(user: UserDocument, provider: ChatProviderId): boolean {
-  if (provider === 'openai') return Boolean(user.openaiApiKeyEncrypted);
-  if (provider === 'anthropic') return Boolean(user.anthropicApiKeyEncrypted);
-  if (provider === 'google') return Boolean(user.googleApiKeyEncrypted);
-  if (provider === 'xai') return Boolean(user.xaiApiKeyEncrypted);
-  // Custom endpoints often have no API key (local Ollama, etc.) — base URL is enough.
-  return Boolean(user.customBaseUrl?.trim());
+  return chatKeyReady(user, provider);
 }
 
 export function settingsPayload(user: UserDocument) {
   const { provider, model } = resolveChatSelection(user.chatProvider, user.chatModel);
+  const documentProvider = resolveDocumentProvider(user.documentProvider);
   return {
     hasOpenAIKey: Boolean(user.openaiApiKeyEncrypted),
     openaiKeyLast4: user.openaiKeyLast4 ?? null,
+    documentProvider,
+    documentModel: user.documentModel ?? null,
+    hasDocumentKey: documentKeyReady(user, documentProvider),
     chatProvider: provider,
     chatModel: model,
     chatProviders: CHAT_PROVIDERS,
@@ -86,7 +89,7 @@ export function settingsPayload(user: UserDocument) {
     hasCustomKey: Boolean(user.customApiKeyEncrypted),
     customKeyLast4: user.customKeyLast4 ?? null,
     customBaseUrl: user.customBaseUrl ?? null,
-    canChat: Boolean(user.openaiApiKeyEncrypted) && hasChatProviderKey(user, provider),
+    canChat: workspaceCanChat(user),
     deletionScheduledFor: user.deletionScheduledFor
       ? new Date(user.deletionScheduledFor).toISOString()
       : null,
@@ -141,6 +144,34 @@ export const deleteOpenAIKeyHandler = asyncHandler(async (req: AuthedRequest, re
   user.openaiKeyLast4 = undefined;
   await user.save();
   res.json(settingsPayload(user));
+});
+
+const documentProviderBody = z.object({
+  provider: z.enum(['openai', 'google', 'custom']),
+  documentModel: z.string().trim().max(120).optional(),
+  confirm: z.boolean().optional().default(false),
+});
+
+export const previewDocumentProviderHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
+  const body = documentProviderBody.parse(req.body);
+  editableKeys(req);
+  const library = libraryFilter(req.workspace!, req.user!._id);
+  const preview = await previewDocumentRebuild(library, body.provider, body.documentModel);
+  res.json(preview);
+});
+
+export const putDocumentProviderHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
+  const body = documentProviderBody.parse(req.body);
+  const owner = editableKeys(req);
+  const library = libraryFilter(req.workspace!, req.user!._id);
+  await applyDocumentProvider({
+    owner,
+    library,
+    provider: body.provider,
+    documentModel: body.documentModel,
+    confirm: body.confirm,
+  });
+  res.json(settingsPayload(owner));
 });
 
 export const putChatPrefsHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {

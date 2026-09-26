@@ -7,11 +7,16 @@ const userSchema = new Schema(
     avatarUrl: { type: String },
     avatarPublicId: { type: String },
 
-    /** Required for embeddings + OCR (and OpenAI chat). */
+    /** Required when documentProvider or chat is OpenAI. */
     openaiApiKeyEncrypted: { type: String },
     openaiKeyLast4: { type: String },
 
-    /** Chat answer provider — embeddings/OCR stay on OpenAI. */
+    /** Who reads files and builds embeddings. Claude and Grok are not valid here. */
+    documentProvider: { type: String, default: 'openai' },
+    /** Vision model for Custom documents. OpenAI and Gemini use fixed defaults. */
+    documentModel: { type: String },
+
+    /** Chat answer provider. Can differ from documentProvider. */
     chatProvider: { type: String, default: 'openai' },
     chatModel: { type: String, default: 'gpt-4o-mini' },
 

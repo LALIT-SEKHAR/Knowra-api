@@ -10,8 +10,10 @@ import {
   deleteOpenAIKeyHandler,
   deleteProviderKeyHandler,
   getSettingsHandler,
+  previewDocumentProviderHandler,
   putChatModelHandler,
   putChatPrefsHandler,
+  putDocumentProviderHandler,
   putOpenAIKeyHandler,
   putProviderKeyHandler,
   requestDeleteAccountOtpHandler,
@@ -72,6 +74,8 @@ router.use(requireAuth);
 router.get('/', getSettingsHandler);
 router.put('/openai-key', putOpenAIKeyHandler);
 router.delete('/openai-key', deleteOpenAIKeyHandler);
+router.post('/document-provider/preview', previewDocumentProviderHandler);
+router.put('/document-provider', putDocumentProviderHandler);
 router.put('/chat-prefs', putChatPrefsHandler);
 router.put('/chat-model', putChatModelHandler);
 router.put('/provider-key', putProviderKeyHandler);

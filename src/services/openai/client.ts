@@ -108,11 +108,15 @@ export async function validateOpenAIKey(apiKey: string, baseURL?: string): Promi
   return true;
 }
 
-export async function createEmbedding(apiKey: string, text: string): Promise<EmbeddingResult> {
-  const client = createOpenAIClient(apiKey);
+export async function createEmbedding(
+  apiKey: string,
+  text: string,
+  options?: { baseURL?: string; model?: string },
+): Promise<EmbeddingResult> {
+  const client = createOpenAIClient(apiKey, options?.baseURL);
   const response = await withRateLimitRetry(() =>
     client.embeddings.create({
-      model: EMBEDDING_MODEL,
+      model: options?.model || EMBEDDING_MODEL,
       input: text,
     }),
   );
@@ -132,9 +136,11 @@ export async function createEmbeddings(
   apiKey: string,
   texts: string[],
   onProgress?: (completed: number, total: number) => void | Promise<void>,
+  options?: { baseURL?: string; model?: string },
 ): Promise<EmbeddingsResult> {
   if (texts.length === 0) return { embeddings: [], usage: emptyUsage() };
-  const client = createOpenAIClient(apiKey);
+  const client = createOpenAIClient(apiKey, options?.baseURL);
+  const model = options?.model || EMBEDDING_MODEL;
   const batchSize = 64;
   const results: number[][] = [];
   let usage = emptyUsage();
@@ -144,7 +150,7 @@ export async function createEmbeddings(
     const batch = texts.slice(i, i + batchSize);
     const response = await withRateLimitRetry(() =>
       client.embeddings.create({
-        model: EMBEDDING_MODEL,
+        model,
         input: batch,
       }),
     );
@@ -165,14 +171,18 @@ export async function createEmbeddings(
   return { embeddings: results, usage };
 }
 
-const OCR_PROMPT =
+export const OCR_PROMPT =
   'Extract all readable text from this document page image. Preserve reading order, headings, lists, and mathematical notation as plain text. Return only the extracted text with no commentary. If the page has no readable text, return an empty string.';
 
-export async function extractTextFromImage(apiKey: string, dataUrl: string): Promise<OcrResult> {
-  const client = createOpenAIClient(apiKey);
+export async function extractTextFromImage(
+  apiKey: string,
+  dataUrl: string,
+  options?: { model?: string; baseURL?: string },
+): Promise<OcrResult> {
+  const client = createOpenAIClient(apiKey, options?.baseURL);
   const response = await withRateLimitRetry(() =>
     client.chat.completions.create({
-      model: OCR_MODEL,
+      model: options?.model || OCR_MODEL,
       temperature: 0,
       messages: [
         {

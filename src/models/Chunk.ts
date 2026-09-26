@@ -8,6 +8,9 @@ const chunkSchema = new Schema(
     orgId: { type: Schema.Types.ObjectId, ref: 'Organization', default: null, index: true },
     content: { type: String, required: true },
     embedding: { type: [Number], required: true },
+    /** Missing means OpenAI, for chunks created before this field existed. */
+    embeddingProvider: { type: String, default: 'openai' },
+    embeddingModel: { type: String, default: 'text-embedding-3-small' },
     pageNumber: { type: Number },
     chunkIndex: { type: Number, required: true },
     metadata: { type: Schema.Types.Mixed },

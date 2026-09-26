@@ -11,6 +11,8 @@ import {
 } from '../services/cloudinary/storage.js';
 import { listMemberships, libraryFilter } from '../services/orgs/workspace.js';
 import { DocumentModel } from '../models/Document.js';
+import { resolveDocumentProvider } from '../config/documentProviders.js';
+import { documentKeyReady, workspaceCanChat } from '../services/documents/access.js';
 const AVATAR_MAX_BYTES = 2 * 1024 * 1024;
 
 const emailSchema = z.object({
@@ -41,17 +43,8 @@ export function serializeUser(user: UserDocument) {
   const pendingDeletion =
     Boolean(deletionScheduledFor) && deletionScheduledFor!.getTime() > Date.now();
 
+  const documentProvider = resolveDocumentProvider(user.documentProvider);
   const chatProvider = user.chatProvider ?? 'openai';
-  const hasChatKey =
-    chatProvider === 'openai'
-      ? Boolean(user.openaiApiKeyEncrypted)
-      : chatProvider === 'anthropic'
-        ? Boolean(user.anthropicApiKeyEncrypted)
-        : chatProvider === 'google'
-          ? Boolean(user.googleApiKeyEncrypted)
-          : chatProvider === 'xai'
-            ? Boolean(user.xaiApiKeyEncrypted)
-            : Boolean(user.customBaseUrl);
 
   return {
     id: user._id.toString(),
@@ -60,6 +53,9 @@ export function serializeUser(user: UserDocument) {
     avatarUrl: user.avatarUrl ?? null,
     hasOpenAIKey: Boolean(user.openaiApiKeyEncrypted),
     openaiKeyLast4: user.openaiKeyLast4 ?? null,
+    documentProvider,
+    documentModel: user.documentModel ?? null,
+    hasDocumentKey: documentKeyReady(user, documentProvider),
     chatProvider,
     chatModel: user.chatModel ?? 'gpt-4o-mini',
     hasAnthropicKey: Boolean(user.anthropicApiKeyEncrypted),
@@ -67,7 +63,7 @@ export function serializeUser(user: UserDocument) {
     hasXaiKey: Boolean(user.xaiApiKeyEncrypted),
     hasCustomKey: Boolean(user.customApiKeyEncrypted),
     customBaseUrl: user.customBaseUrl ?? null,
-    canChat: Boolean(user.openaiApiKeyEncrypted) && hasChatKey,
+    canChat: workspaceCanChat(user),
     deletionScheduledFor: pendingDeletion ? deletionScheduledFor!.toISOString() : null,
   };
 }
@@ -106,6 +102,9 @@ export const meHandler = asyncHandler(async (req: AuthedRequest, res: Response) 
     ...profile,
     hasOpenAIKey: scoped.hasOpenAIKey,
     openaiKeyLast4: workspace.canManage ? scoped.openaiKeyLast4 : null,
+    documentProvider: scoped.documentProvider,
+    documentModel: workspace.canManage ? scoped.documentModel : null,
+    hasDocumentKey: scoped.hasDocumentKey,
     chatProvider: scoped.chatProvider,
     chatModel: scoped.chatModel,
     hasAnthropicKey: scoped.hasAnthropicKey,

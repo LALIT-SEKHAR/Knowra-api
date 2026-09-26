@@ -5,7 +5,6 @@ import { Conversation } from '../../models/Conversation.js';
 import { Message } from '../../models/Message.js';
 import { User } from '../../models/User.js';
 import { Organization } from '../../models/Organization.js';
-import { decryptSecret } from '../../utils/crypto.js';
 import {
   cloudinaryUrlsOf,
   deleteCloudinaryFile,
@@ -14,8 +13,13 @@ import {
 import { isExcelMime, isImageMime, isWordMime } from '../documents/fileTypes.js';
 import { extractOfficePages } from '../documents/office.js';
 import { chunkPages, extractPdfPages, type PageText } from '../documents/parser.js';
-import { ocrPdfPages, ocrStandaloneImage } from '../documents/ocr.js';
-import { createEmbeddings } from '../openai/client.js';
+import { documentCredentials, documentKeyReady, missingDocumentKeyMessage } from '../documents/access.js';
+import { ocrPdfPages, ocrStandaloneImage, type PageVision } from '../documents/ocr.js';
+import { embedDocumentChunks } from '../embeddings/create.js';
+import {
+  embeddingModelFor,
+  resolveDocumentProvider,
+} from '../../config/documentProviders.js';
 import { purgeUserDataCompletely } from '../user/purge.js';
 import { recordUsage } from '../usage/record.js';
 
@@ -100,9 +104,17 @@ async function processDocumentJob(payload: { documentId: string; userId: string 
   const keyOwner = document.orgId
     ? await Organization.findById(document.orgId)
     : await User.findById(payload.userId);
-  if (!keyOwner?.openaiApiKeyEncrypted) {
+  const startedProvider = resolveDocumentProvider(keyOwner?.documentProvider);
+  const credentials = keyOwner ? documentCredentials(keyOwner) : null;
+  if (!credentials) {
+    const provider = resolveDocumentProvider(keyOwner?.documentProvider);
+    const hasKey = Boolean(keyOwner && documentKeyReady(keyOwner, provider));
     document.status = 'failed';
-    document.errorMessage = 'OpenAI API key is required in Settings before processing';
+    document.errorMessage = !keyOwner
+      ? 'OpenAI API key is required in Settings before processing'
+      : hasKey && provider === 'custom'
+        ? 'Type a model name in Settings → AI before processing'
+        : missingDocumentKeyMessage(provider).replace(' before uploading', ' before processing');
     await document.save();
     return;
   }
@@ -125,7 +137,12 @@ async function processDocumentJob(payload: { documentId: string; userId: string 
 
   const buffer = await downloadCloudinaryFiles(cloudinaryUrlsOf(document));
   await setProgress(12, 'reading');
-  const apiKey = decryptSecret(keyOwner.openaiApiKeyEncrypted);
+  const vision: PageVision = {
+    provider: credentials.provider,
+    apiKey: credentials.apiKey,
+    model: credentials.readModel,
+    baseURL: credentials.baseURL,
+  };
 
   let pages: PageText[];
   let ocrPages = 0;
@@ -136,7 +153,7 @@ async function processDocumentJob(payload: { documentId: string; userId: string 
   try {
     if (image) {
       await setProgress(20, 'extracting');
-      const ocr = await ocrStandaloneImage(buffer, apiKey);
+      const ocr = await ocrStandaloneImage(buffer, vision);
       pages = ocr.pages;
       ocrPages = ocr.pageCount;
       ocrTokens = ocr.usage.totalTokens;
@@ -149,7 +166,7 @@ async function processDocumentJob(payload: { documentId: string; userId: string 
     } else {
       pages = await extractPdfPages(buffer);
       if (pages.length === 0) {
-        const ocr = await ocrPdfPages(buffer, apiKey, async ({ completedPages, totalPages }) => {
+        const ocr = await ocrPdfPages(buffer, vision, async ({ completedPages, totalPages }) => {
           const ratio = totalPages > 0 ? completedPages / totalPages : 1;
           await setProgress(15 + ratio * 50, 'extracting');
         });
@@ -192,14 +209,25 @@ async function processDocumentJob(payload: { documentId: string; userId: string 
     return;
   }
 
-  const embeddingsResult = await createEmbeddings(
-    apiKey,
+  const embeddingsResult = await embedDocumentChunks(
+    {
+      provider: credentials.provider,
+      apiKey: credentials.apiKey,
+      baseURL: credentials.baseURL,
+    },
     textChunks.map((c) => c.content),
     async (completed, total) => {
       const ratio = total > 0 ? completed / total : 1;
       await setProgress(65 + ratio * 30, 'indexing');
     },
   );
+
+  const freshOwner = document.orgId
+    ? await Organization.findById(document.orgId)
+    : await User.findById(payload.userId);
+  if (resolveDocumentProvider(freshOwner?.documentProvider) !== startedProvider) {
+    throw new Error('Document provider changed while this file was processing. It will be read again.');
+  }
 
   await setProgress(96, 'finishing');
 
@@ -211,6 +239,8 @@ async function processDocumentJob(payload: { documentId: string; userId: string 
     orgId: document.orgId ?? null,
     content: chunk.content,
     embedding: embeddingsResult.embeddings[index],
+    embeddingProvider: credentials.provider,
+    embeddingModel: embeddingModelFor(credentials.provider),
     pageNumber: chunk.pageNumber,
     chunkIndex: chunk.chunkIndex,
   }));
@@ -308,7 +338,7 @@ async function handleJob(job: Awaited<ReturnType<typeof claimNextJob>>) {
     const maxAttempts = job.maxAttempts ?? 5;
     const rateLimited = /\b429\b/.test(message) || /rate limit/i.test(message);
     const publicMessage = rateLimited
-      ? 'OpenAI rate limit was reached while reading this file. Retry it in a minute.'
+      ? 'The document provider rate limit was reached while reading this file. Retry it in a minute.'
       : message;
 
     if (attempts >= maxAttempts) {

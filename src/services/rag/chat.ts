@@ -1,5 +1,13 @@
 import mongoose from 'mongoose';
 import { env } from '../../config/env.js';
+import {
+  documentProviderLabel,
+  embeddingProviderMongoFilter,
+  resolveDocumentProvider,
+  storedEmbeddingMatches,
+  vectorIndexFor,
+  type DocumentProviderId,
+} from '../../config/documentProviders.js';
 import { Chunk } from '../../models/Chunk.js';
 import { Conversation, type ConversationDocument } from '../../models/Conversation.js';
 import { Message } from '../../models/Message.js';
@@ -7,6 +15,7 @@ import { DocumentModel } from '../../models/Document.js';
 import { User } from '../../models/User.js';
 import type { OrganizationDocument } from '../../models/Organization.js';
 import { decryptSecret } from '../../utils/crypto.js';
+import type { DocumentCredentials } from '../documents/access.js';
 import { AppError } from '../../utils/errors.js';
 import {
   libraryFilter,
@@ -18,7 +27,8 @@ import {
 } from '../../config/chatProviders.js';
 import { generateChatAnswer } from '../chat/generate.js';
 import { canonicalizeMarkdownMath } from '../chat/markdownMath.js';
-import { createEmbedding } from '../openai/client.js';
+import { documentCredentials, missingDocumentKeyMessage, chatKeyReady } from '../documents/access.js';
+import { embedSearchQuery } from '../embeddings/create.js';
 import { recordUsage } from '../usage/record.js';
 
 export type SourceRef = {
@@ -34,6 +44,7 @@ type RetrievedChunk = {
   content: string;
   pageNumber?: number;
   orgId?: mongoose.Types.ObjectId | null;
+  embeddingProvider?: string | null;
   score?: number;
   documentName?: string;
 };
@@ -53,12 +64,14 @@ async function loadChunksFallback(
   userId: string,
   documentIds: mongoose.Types.ObjectId[],
   workspace: Workspace,
+  provider: DocumentProviderId,
   limit = 8,
 ): Promise<RetrievedChunk[]> {
   if (documentIds.length === 0) return [];
 
   const fallback = await Chunk.find({
     ...libraryFilter(workspace, new mongoose.Types.ObjectId(userId)),
+    ...embeddingProviderMongoFilter(provider),
     documentId: { $in: documentIds },
   })
     .sort({ createdAt: -1 })
@@ -78,6 +91,7 @@ async function vectorSearch(
   documentIds: mongoose.Types.ObjectId[] | null,
   queryEmbedding: number[],
   workspace: Workspace,
+  provider: DocumentProviderId,
   limit = 8,
 ): Promise<RetrievedChunk[]> {
   const filter: Record<string, unknown> = {};
@@ -100,7 +114,7 @@ async function vectorSearch(
     const results = await Chunk.aggregate<RetrievedChunk>([
       {
         $vectorSearch: {
-          index: env.VECTOR_INDEX_NAME,
+          index: vectorIndexFor(provider, env.VECTOR_INDEX_NAME),
           path: 'embedding',
           queryVector: queryEmbedding,
           numCandidates: Math.max(120, limit * 25),
@@ -114,15 +128,18 @@ async function vectorSearch(
           pageNumber: 1,
           documentId: 1,
           orgId: 1,
+          embeddingProvider: 1,
           score: { $meta: 'vectorSearchScore' },
         },
       },
     ]);
 
     if (results.length > 0) {
-      const scoped = workspace.orgId
-        ? results.filter((chunk) => chunk.orgId?.toString() === workspace.orgId?.toString())
-        : results.filter((chunk) => !chunk.orgId);
+      const scoped = (
+        workspace.orgId
+          ? results.filter((chunk) => chunk.orgId?.toString() === workspace.orgId?.toString())
+          : results.filter((chunk) => !chunk.orgId)
+      ).filter((chunk) => storedEmbeddingMatches(chunk.embeddingProvider, provider));
       if (scoped.length > 0) return scoped;
     }
 
@@ -133,7 +150,13 @@ async function vectorSearch(
     console.warn('Vector search unavailable, falling back to stored chunks', err);
   }
 
-  return loadChunksFallback(userId, documentIds ?? (await getReadyDocumentIds(userId, workspace)), workspace, limit);
+  return loadChunksFallback(
+    userId,
+    documentIds ?? (await getReadyDocumentIds(userId, workspace)),
+    workspace,
+    provider,
+    limit,
+  );
 }
 
 async function attachDocumentNames(chunks: RetrievedChunk[]): Promise<RetrievedChunk[]> {
@@ -230,7 +253,6 @@ async function lockConversationTitleOnce(params: {
       model: params.access.chatModel,
       apiKey: params.access.chatApiKey,
       baseUrl: params.access.customBaseUrl,
-      temperature: 0.2,
       maxTokens: 24,
       system:
         'Name this chat in 3 to 6 words from what the user and assistant actually said, including greetings and short replies. Reply with the title only. No quotes, no punctuation at the end, no prefix.',
@@ -326,7 +348,7 @@ function buildContextBlock(chunks: RetrievedChunk[]): string {
 }
 
 type ChatAccess = {
-  openaiApiKey: string;
+  documents: DocumentCredentials;
   chatProvider: ChatProviderId;
   chatModel: string;
   chatApiKey: string;
@@ -334,6 +356,8 @@ type ChatAccess = {
 };
 
 type KeySource = {
+  documentProvider?: string | null;
+  documentModel?: string | null;
   openaiApiKeyEncrypted?: string | null;
   chatProvider?: string | null;
   chatModel?: string | null;
@@ -344,93 +368,104 @@ type KeySource = {
   customBaseUrl?: string | null;
 };
 
-async function requireChatAccess(userId: string, workspace: Workspace): Promise<ChatAccess> {
-  const source: KeySource | OrganizationDocument | null = workspace.org
-    ? workspace.org
-    : await User.findById(userId);
-  if (!source?.openaiApiKeyEncrypted) {
-    throw new AppError(
-      workspace.org
-        ? 'Your organization admin needs to add an OpenAI API key in Settings → AI'
-        : 'Add your OpenAI API key in Settings → AI (needed to search your documents)',
+function chatKeyError(workspace: Workspace, provider: ChatProviderId): AppError {
+  const org = Boolean(workspace.org);
+  if (provider === 'anthropic') {
+    return new AppError(
+      org
+        ? 'Your organization admin needs to add an Anthropic API key for Claude chat'
+        : 'Add your Anthropic API key in Settings → AI for Claude chat',
       400,
     );
   }
-
-  const { provider, model } = resolveChatSelection(source.chatProvider, source.chatModel);
-  const openaiApiKey = decryptSecret(source.openaiApiKeyEncrypted);
-
-  if (provider === 'openai') {
-    return {
-      openaiApiKey,
-      chatProvider: provider,
-      chatModel: model,
-      chatApiKey: openaiApiKey,
-    };
-  }
-
-  if (provider === 'anthropic') {
-    if (!source.anthropicApiKeyEncrypted) {
-      throw new AppError(
-        workspace.org
-          ? 'Your organization admin needs to add an Anthropic API key for Claude chat'
-          : 'Add your Anthropic API key in Settings → AI for Claude chat',
-        400,
-      );
-    }
-    return {
-      openaiApiKey,
-      chatProvider: provider,
-      chatModel: model,
-      chatApiKey: decryptSecret(source.anthropicApiKeyEncrypted),
-    };
-  }
-
   if (provider === 'google') {
-    if (!source.googleApiKeyEncrypted) {
-      throw new AppError(
-        workspace.org
-          ? 'Your organization admin needs to add a Google AI API key for Gemini chat'
-          : 'Add your Google AI API key in Settings → AI for Gemini chat',
-        400,
-      );
-    }
-    return {
-      openaiApiKey,
-      chatProvider: provider,
-      chatModel: model,
-      chatApiKey: decryptSecret(source.googleApiKeyEncrypted),
-    };
+    return new AppError(
+      org
+        ? 'Your organization admin needs to add a Google AI API key for Gemini chat'
+        : 'Add your Google AI API key in Settings → AI for Gemini chat',
+      400,
+    );
   }
-
   if (provider === 'xai') {
-    if (!source.xaiApiKeyEncrypted) {
-      throw new AppError(
-        workspace.org
-          ? 'Your organization admin needs to add an xAI API key for Grok chat'
-          : 'Add your xAI API key in Settings → AI for Grok chat',
-        400,
-      );
-    }
-    return {
-      openaiApiKey,
-      chatProvider: provider,
-      chatModel: model,
-      chatApiKey: decryptSecret(source.xaiApiKeyEncrypted),
-    };
+    return new AppError(
+      org
+        ? 'Your organization admin needs to add an xAI API key for Grok chat'
+        : 'Add your xAI API key in Settings → AI for Grok chat',
+      400,
+    );
   }
-
-  if (!source.customBaseUrl?.trim()) {
-    throw new AppError(
-      workspace.org
+  if (provider === 'custom') {
+    return new AppError(
+      org
         ? 'Your organization admin needs to add a custom API base URL before chatting'
         : 'Add your custom API base URL in Settings → AI before chatting',
       400,
     );
   }
+  return new AppError(
+    org
+      ? 'Your organization admin needs to add an OpenAI API key for chat'
+      : 'Add your OpenAI API key in Settings → AI before chatting',
+    400,
+  );
+}
+
+async function requireChatAccess(userId: string, workspace: Workspace): Promise<ChatAccess> {
+  const source: KeySource | OrganizationDocument | null = workspace.org
+    ? workspace.org
+    : await User.findById(userId);
+  const documents = source ? documentCredentials(source) : null;
+  if (!source || !documents) {
+    const provider = resolveDocumentProvider(source?.documentProvider);
+    throw new AppError(
+      missingDocumentKeyMessage(provider, Boolean(workspace.org)).replace(
+        ' before uploading',
+        ' (needed to search your documents)',
+      ),
+      400,
+    );
+  }
+
+  const { provider, model } = resolveChatSelection(source.chatProvider, source.chatModel);
+  if (!chatKeyReady(source, provider)) {
+    throw chatKeyError(workspace, provider);
+  }
+
+  if (provider === 'openai') {
+    return {
+      documents,
+      chatProvider: provider,
+      chatModel: model,
+      chatApiKey: decryptSecret(source.openaiApiKeyEncrypted!),
+    };
+  }
+  if (provider === 'anthropic') {
+    return {
+      documents,
+      chatProvider: provider,
+      chatModel: model,
+      chatApiKey: decryptSecret(source.anthropicApiKeyEncrypted!),
+    };
+  }
+  if (provider === 'google') {
+    return {
+      documents,
+      chatProvider: provider,
+      chatModel: model,
+      chatApiKey: decryptSecret(source.googleApiKeyEncrypted!),
+    };
+  }
+  if (provider === 'xai') {
+    return {
+      documents,
+      chatProvider: provider,
+      chatModel: model,
+      chatApiKey: decryptSecret(source.xaiApiKeyEncrypted!),
+    };
+  }
 
   return {
-    openaiApiKey,
+    documents,
     chatProvider: 'custom',
     chatModel: model,
     chatApiKey: source.customApiKeyEncrypted
@@ -452,7 +487,7 @@ async function runChat(params: {
   conversationId: string;
 }> {
   const access = await requireChatAccess(params.userId, params.workspace);
-  const { openaiApiKey, chatProvider, chatModel, chatApiKey, customBaseUrl } = access;
+  const { documents, chatProvider, chatModel, chatApiKey, customBaseUrl } = access;
   const casual = isCasualMessage(params.question);
 
   let documentIds: mongoose.Types.ObjectId[] | null = null;
@@ -475,6 +510,16 @@ async function runChat(params: {
     } else {
       const readyIds = await getReadyDocumentIds(params.userId, params.workspace);
       if (readyIds.length === 0) {
+        const processing = await DocumentModel.countDocuments({
+          ...libraryFilter(params.workspace, new mongoose.Types.ObjectId(params.userId)),
+          status: 'processing',
+        });
+        if (processing > 0) {
+          throw new AppError(
+            `Re-reading your files for ${documentProviderLabel(documents.provider)}. Chat will work again when a file is Ready.`,
+            400,
+          );
+        }
         throw new AppError('Upload and process at least one PDF before chatting.', 400);
       }
       // Library mode: search all of this user's chunks (userId filter only)
@@ -486,7 +531,10 @@ async function runChat(params: {
       ? { ...owner, documentId: documentIds[0] }
       : owner;
 
-    const chunkCount = await Chunk.countDocuments(chunkFilter);
+    const chunkCount = await Chunk.countDocuments({
+      ...chunkFilter,
+      ...embeddingProviderMongoFilter(documents.provider),
+    });
     if (chunkCount === 0) {
       throw new AppError(
         'No indexed document content yet. Wait for processing to finish, or retry from Files.',
@@ -575,8 +623,12 @@ async function runChat(params: {
     };
   }
 
-  const queryEmbedding = await createEmbedding(
-    openaiApiKey,
+  const queryEmbedding = await embedSearchQuery(
+    {
+      provider: documents.provider,
+      apiKey: documents.apiKey,
+      baseURL: documents.baseURL,
+    },
     `${params.question}\n${calendarHint()}`,
   );
   const retrievedRaw = await vectorSearch(
@@ -584,6 +636,7 @@ async function runChat(params: {
     scope === 'library' ? null : documentIds,
     queryEmbedding.embedding,
     params.workspace,
+    documents.provider,
   );
   const retrieved = await attachDocumentNames(retrievedRaw);
 
