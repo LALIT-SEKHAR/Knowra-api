@@ -4,6 +4,7 @@ import orgRoutes from './orgs.js';
 import settingsRoutes from './settings.js';
 import documentsRoutes from './documents.js';
 import conversationsRoutes from './conversations.js';
+import quizzesRoutes from './quizzes.js';
 import usageRoutes from './usage.js';
 import cronRoutes from './cron.js';
 
@@ -18,6 +19,7 @@ router.use('/orgs', orgRoutes);
 router.use('/settings', settingsRoutes);
 router.use('/documents', documentsRoutes);
 router.use('/conversations', conversationsRoutes);
+router.use('/quizzes', quizzesRoutes);
 router.use('/usage', usageRoutes);
 router.use('/cron', cronRoutes);
 

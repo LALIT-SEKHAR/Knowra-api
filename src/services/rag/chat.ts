@@ -18,6 +18,7 @@ import {
 } from '../../config/chatProviders.js';
 import { generateChatAnswer } from '../chat/generate.js';
 import { canonicalizeMarkdownMath } from '../chat/markdownMath.js';
+import { runTutorAgent } from '../tutor/agent.js';
 import { createEmbedding } from '../openai/client.js';
 import { recordUsage } from '../usage/record.js';
 
@@ -445,6 +446,7 @@ async function runChat(params: {
   question: string;
   conversationId?: string;
   documentId?: string;
+  mention?: { name: string; at: number };
   workspace: Workspace;
 }): Promise<{
   answer: string;
@@ -540,6 +542,7 @@ async function runChat(params: {
       conversationId: conversation._id,
       role: 'user',
       content: params.question,
+      mention: params.mention,
     });
     await Message.create({
       conversationId: conversation._id,
@@ -571,6 +574,99 @@ async function runChat(params: {
     return {
       answer: content,
       sources: [],
+      conversationId: conversation._id.toString(),
+    };
+  }
+
+  const supportsTools =
+    chatProvider === 'openai' || chatProvider === 'xai' || chatProvider === 'custom';
+
+  if (supportsTools) {
+    const agent = await runTutorAgent({
+      provider: chatProvider,
+      model: chatModel,
+      apiKey: chatApiKey,
+      baseUrl: customBaseUrl,
+      question: params.question,
+      history: recentHistory.flatMap((message) =>
+        message.role === 'user' || message.role === 'assistant'
+          ? [{ role: message.role, content: message.content }]
+          : [],
+      ),
+      dateLine: calendarHint(),
+      scope,
+      userId: params.userId,
+      workspace: params.workspace,
+      conversationId: conversation._id.toString(),
+      documentIds,
+      search: async (query) => {
+        const queryEmbedding = await createEmbedding(
+          openaiApiKey,
+          `${query}\n${calendarHint()}`,
+        );
+        const retrievedRaw = await vectorSearch(
+          params.userId,
+          scope === 'library' ? null : documentIds,
+          queryEmbedding.embedding,
+          params.workspace,
+          6,
+        );
+        const retrieved = await attachDocumentNames(retrievedRaw);
+        return {
+          embeddingTokens: queryEmbedding.usage.totalTokens,
+          hits: retrieved.map((chunk) => ({
+            chunkId: chunk._id.toString(),
+            documentId: chunk.documentId.toString(),
+            documentName: chunk.documentName ?? 'Document',
+            pageNumber: chunk.pageNumber,
+            excerpt: chunk.content.slice(0, 700),
+          })),
+        };
+      },
+    });
+    const content = canonicalizeMarkdownMath(agent.content);
+    const sources = agent.sources;
+
+    await Message.create({
+      conversationId: conversation._id,
+      role: 'user',
+      content: params.question,
+      mention: params.mention,
+    });
+    await Message.create({
+      conversationId: conversation._id,
+      role: 'assistant',
+      content,
+      sources,
+      steps: agent.steps.length ? agent.steps : undefined,
+      quizId: agent.quizId,
+    });
+
+    await lockConversationTitleOnce({
+      conversation,
+      priorMessages: history.map((message) => ({ role: message.role, content: message.content })),
+      question: params.question,
+      answer: content,
+      access,
+      userId: params.userId,
+    });
+    conversation.updatedAt = new Date();
+    if (!conversation.title) {
+      conversation.title = params.question.slice(0, 80);
+    }
+    await conversation.save();
+
+    await recordUsage(params.userId, {
+      chats: 1,
+      chatTokens: agent.usage.chatTokens,
+      embeddings: agent.usage.embeddings,
+      embeddingTokens: agent.usage.embeddingTokens,
+      aiCalls: agent.usage.aiCalls,
+    });
+
+    return {
+      answer: content,
+      sources,
       conversationId: conversation._id.toString(),
     };
   }
@@ -623,6 +719,7 @@ async function runChat(params: {
     conversationId: conversation._id,
     role: 'user',
     content: params.question,
+    mention: params.mention,
   });
   await Message.create({
     conversationId: conversation._id,
@@ -666,6 +763,7 @@ export async function chatWithDocument(params: {
   documentId: string;
   question: string;
   conversationId?: string;
+  mention?: { name: string; at: number };
   workspace: Workspace;
 }) {
   return runChat(params);
@@ -676,6 +774,7 @@ export async function chatAcrossLibrary(params: {
   question: string;
   conversationId?: string;
   documentId?: string;
+  mention?: { name: string; at: number };
   workspace: Workspace;
 }) {
   return runChat(params);

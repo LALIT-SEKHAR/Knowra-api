@@ -19,6 +19,30 @@ import { createEmbeddings } from '../openai/client.js';
 import { purgeUserDataCompletely } from '../user/purge.js';
 import { recordUsage } from '../usage/record.js';
 
+function publicProcessingError(message: string): string {
+  const text = message.replace(/\s+/g, ' ').trim();
+  const lower = text.toLowerCase();
+  if (/api key/i.test(text) && /401|incorrect|invalid|rejected|unauthorized/i.test(text)) {
+    return 'The OpenAI API key was rejected. Open Settings → AI and save a valid key.';
+  }
+  if (lower.includes('rate limit') || /\b429\b/.test(lower)) {
+    return 'OpenAI rate limit was reached while reading this file. Retry it in a minute.';
+  }
+  if (lower.includes('insufficient_quota') || lower.includes('quota')) {
+    return 'The OpenAI account is out of quota. Check billing, then retry this file.';
+  }
+  const stripped = text
+    .replace(/sk-[a-zA-Z0-9*_-]+/g, '')
+    .replace(/\*+/g, '')
+    .replace(/https?:\/\/\S+/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const sentence = stripped.split(/(?<=[.!?])\s/)[0] ?? stripped;
+  if (!sentence) return 'Could not read this file.';
+  if (sentence.length <= 180) return sentence;
+  return `${sentence.slice(0, 177).trim()}…`;
+}
+
 const WORKER_ID = `worker-${process.pid}`;
 const POLL_MS = 2000;
 
@@ -171,7 +195,7 @@ async function processDocumentJob(payload: { documentId: string; userId: string 
       throw err;
     }
     document.status = 'failed';
-    document.errorMessage = message;
+    document.errorMessage = publicProcessingError(message);
     await document.save();
     return;
   }
@@ -307,9 +331,7 @@ async function handleJob(job: Awaited<ReturnType<typeof claimNextJob>>) {
     const attempts = job.attempts ?? 1;
     const maxAttempts = job.maxAttempts ?? 5;
     const rateLimited = /\b429\b/.test(message) || /rate limit/i.test(message);
-    const publicMessage = rateLimited
-      ? 'OpenAI rate limit was reached while reading this file. Retry it in a minute.'
-      : message;
+    const publicMessage = publicProcessingError(message);
 
     if (attempts >= maxAttempts) {
       job.status = 'failed';

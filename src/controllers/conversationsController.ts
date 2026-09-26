@@ -1,6 +1,8 @@
 import { z } from 'zod';
 import type { Response } from 'express';
+import mongoose from 'mongoose';
 import { asyncHandler, AppError } from '../utils/errors.js';
+import { listFocus, quizzesForUser, toPublicQuiz } from '../services/tutor/quizStore.js';
 import type { AuthedRequest } from '../middleware/auth.js';
 import { Conversation } from '../models/Conversation.js';
 import { Message } from '../models/Message.js';
@@ -137,16 +139,29 @@ export const getConversationHandler = asyncHandler(async (req: AuthedRequest, re
   const messages = await Message.find({ conversationId: conversation._id }).sort({
     createdAt: 1,
   });
+  const quizIds = messages.flatMap((message) =>
+    message.quizId ? [message.quizId as mongoose.Types.ObjectId] : [],
+  );
+  const quizzes = await quizzesForUser(req.user!._id.toString(), req.workspace!, quizIds);
+  const focus = quizIds.length ? await listFocus(req.user!._id.toString(), req.workspace!) : [];
 
   res.json({
     conversation: serializeConversation(conversation),
-    messages: messages.map((m) => ({
-      id: m._id.toString(),
-      role: m.role,
-      content: m.content,
-      sources: serializeSources(m.sources as never),
-      createdAt: m.createdAt,
-    })),
+    messages: messages.map((m) => {
+      const quiz = m.quizId ? quizzes.get(m.quizId.toString()) : undefined;
+      return {
+        id: m._id.toString(),
+        role: m.role,
+        content: m.content,
+        sources: serializeSources(m.sources as never),
+        steps: m.steps?.length ? m.steps : undefined,
+        mention: m.mention?.name
+          ? { name: m.mention.name, at: m.mention.at }
+          : undefined,
+        quiz: quiz ? toPublicQuiz(quiz, focus) : undefined,
+        createdAt: m.createdAt,
+      };
+    }),
   });
 });
 
@@ -155,6 +170,12 @@ const chatSchema = z.object({
   conversationId: z.string().optional(),
   /** Optional: scope retrieval to one document. Omit to search all ready docs. */
   documentId: z.string().optional(),
+  mention: z
+    .object({
+      name: z.string().min(1).max(300),
+      at: z.number().int().min(0),
+    })
+    .optional(),
 });
 
 export const chatHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
@@ -164,6 +185,7 @@ export const chatHandler = asyncHandler(async (req: AuthedRequest, res: Response
     question: body.question,
     conversationId: body.conversationId,
     documentId: body.documentId,
+    mention: body.mention,
     workspace: req.workspace!,
   });
   res.json(result);

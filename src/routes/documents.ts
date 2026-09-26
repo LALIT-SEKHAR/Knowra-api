@@ -8,6 +8,7 @@ import {
   downloadDocumentHandler,
   getDocumentHandler,
   listDocumentsHandler,
+  mentionableFilesHandler,
   renameDocumentHandler,
   previewDocumentHandler,
   retryDocumentHandler,
@@ -27,7 +28,9 @@ const upload = multer({
   limits: { fileSize: env.MAX_UPLOAD_BYTES },
 });
 
-router.use(requireAuth, requireManager);
+router.use(requireAuth);
+router.get('/mentionable', mentionableFilesHandler);
+router.use(requireManager);
 router.get('/', listDocumentsHandler);
 router.get('/upload-signature', uploadSignatureHandler);
 router.post('/upload-abort', abortUploadHandler);

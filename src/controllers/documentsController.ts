@@ -37,6 +37,19 @@ function owned(req: AuthedRequest) {
   return libraryFilter(req.workspace!, req.user!._id);
 }
 
+export const mentionableFilesHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
+  const docs = await DocumentModel.find({
+    ...owned(req),
+    status: 'ready',
+  })
+    .select('name')
+    .sort({ name: 1 })
+    .limit(200);
+  res.json({
+    files: docs.map((doc) => ({ id: doc._id.toString(), name: doc.name })),
+  });
+});
+
 function serializeDocument(
   doc: InstanceType<typeof DocumentModel>,
   path?: FolderPathSegment[],
