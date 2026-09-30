@@ -2,8 +2,8 @@ import { z } from 'zod';
 import type { Response } from 'express';
 import { asyncHandler, AppError } from '../utils/errors.js';
 import type { AuthedRequest } from '../middleware/auth.js';
+import { User, type UserDocument } from '../models/User.js';
 import { requestOtp, verifyOtp } from '../services/auth/otp.js';
-import type { UserDocument } from '../models/User.js';
 import {
   deleteCloudinaryImage,
   isAllowedAvatarMime,
@@ -192,6 +192,7 @@ export const deleteAvatarHandler = asyncHandler(async (req: AuthedRequest, res: 
   res.json(serializeUser(user));
 });
 
-export const logoutHandler = asyncHandler(async (_req, res) => {
+export const logoutHandler = asyncHandler(async (req: AuthedRequest, res: Response) => {
+  await User.updateOne({ _id: req.user!._id }, { $inc: { authVersion: 1 } });
   res.json({ ok: true });
 });

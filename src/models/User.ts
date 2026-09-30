@@ -37,6 +37,8 @@ const userSchema = new Schema(
     lastLoginAt: { type: Date },
     deletionRequestedAt: { type: Date },
     deletionScheduledFor: { type: Date, index: true },
+    /** Bumped on sign-out so previously issued tokens stop working. */
+    authVersion: { type: Number, default: 0 },
   },
   { timestamps: true },
 );

@@ -10,6 +10,8 @@ import { cancelAccountDeletion } from '../user/purge.js';
 import { createOrganization, joinOrganization } from '../orgs/workspace.js';
 
 const MAX_ATTEMPTS = 5;
+/** Compared when no live code exists so missing and wrong codes take the same time. */
+const DUMMY_CODE_HASH = '$2b$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy';
 
 export type OtpRequestResult = {
   expiresAt: Date;
@@ -72,11 +74,8 @@ async function consumeOtp(email: string, code: string, purpose: OtpPurpose): Pro
           createdAt: -1,
         });
 
-  if (!otp) {
-    throw new AppError('Invalid or expired code', 400);
-  }
-
-  if (otp.expiresAt.getTime() < Date.now()) {
+  if (!otp || otp.expiresAt.getTime() < Date.now()) {
+    await bcrypt.compare(normalizedCode, otp?.codeHash ?? DUMMY_CODE_HASH);
     throw new AppError('Invalid or expired code', 400);
   }
 
@@ -157,7 +156,10 @@ export async function verifyOtp(
   user.lastLoginAt = new Date();
   await user.save();
 
-  const token = signToken({ userId: user._id.toString(), email: user.email });
+  const token = signToken(
+    { userId: user._id.toString(), email: user.email },
+    user.authVersion ?? 0,
+  );
 
   return {
     token,

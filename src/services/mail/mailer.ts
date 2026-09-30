@@ -368,7 +368,6 @@ async function deliverEmail(email: string, subject: string, text: string, html: 
   });
   if (!env.SMTP_HOST && env.NODE_ENV === 'development') {
     console.log('[dev] email (no SMTP configured):', info.message?.toString?.() ?? info);
-    console.log(`[dev] email for ${email}: ${subject}`);
   }
 }
 
@@ -396,6 +395,13 @@ export async function sendOtpEmail(
   try {
     if (env.RESEND_API_KEY) {
       await sendViaResend(email, code, purpose);
+      return;
+    }
+    if (!env.SMTP_HOST) {
+      if (env.NODE_ENV !== 'development') {
+        throw new Error('Email delivery is not configured');
+      }
+      console.log(`[dev] OTP (${purpose}) for ${email}: ${code}`);
       return;
     }
     await sendViaSmtp(email, code, purpose);

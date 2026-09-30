@@ -38,6 +38,20 @@ if (!parsed.success) {
   process.exit(1);
 }
 
+const PLACEHOLDER_JWT = 'change-me-to-a-long-random-string';
+const PLACEHOLDER_KEY = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+
+if (parsed.data.NODE_ENV === 'production') {
+  if (parsed.data.JWT_SECRET.length < 32 || parsed.data.JWT_SECRET === PLACEHOLDER_JWT) {
+    console.error('JWT_SECRET must be a unique random string of at least 32 characters in production.');
+    process.exit(1);
+  }
+  if (parsed.data.ENCRYPTION_KEY === PLACEHOLDER_KEY) {
+    console.error('ENCRYPTION_KEY is still the example value. Set a unique 32-byte hex key before production.');
+    process.exit(1);
+  }
+}
+
 export const env = parsed.data;
 
 /** Free-plan Cloudinary rejects a single raw object above 10 MiB. */

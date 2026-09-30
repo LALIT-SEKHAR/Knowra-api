@@ -8,6 +8,7 @@ import { resolveWorkspace, type Workspace } from '../services/orgs/workspace.js'
 export type AuthPayload = {
   userId: string;
   email: string;
+  av?: number;
 };
 
 export type AuthedRequest = Request & {
@@ -16,12 +17,15 @@ export type AuthedRequest = Request & {
   workspace?: Workspace;
 };
 
-export function signToken(payload: AuthPayload): string {
-  return jwt.sign(payload, env.JWT_SECRET, { expiresIn: '7d' });
+export function signToken(payload: AuthPayload, authVersion = 0): string {
+  return jwt.sign({ userId: payload.userId, email: payload.email, av: authVersion }, env.JWT_SECRET, {
+    expiresIn: '7d',
+    algorithm: 'HS256',
+  });
 }
 
 export function verifyToken(token: string): AuthPayload {
-  return jwt.verify(token, env.JWT_SECRET) as AuthPayload;
+  return jwt.verify(token, env.JWT_SECRET, { algorithms: ['HS256'] }) as AuthPayload;
 }
 
 export async function requireAuth(
@@ -38,6 +42,11 @@ export async function requireAuth(
     const payload = verifyToken(token);
     const user = await User.findById(payload.userId);
     if (!user) {
+      throw new AppError('Unauthorized', 401);
+    }
+    const tokenVersion = payload.av ?? 0;
+    const currentVersion = user.authVersion ?? 0;
+    if (tokenVersion !== currentVersion) {
       throw new AppError('Unauthorized', 401);
     }
     req.auth = payload;

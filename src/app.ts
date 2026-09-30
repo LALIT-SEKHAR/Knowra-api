@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
 import mongoose from 'mongoose';
 import { ZodError } from 'zod';
 import dns from 'node:dns';
@@ -24,9 +25,20 @@ const clientOrigins = env.CLIENT_ORIGIN.split(',')
 
 app.use(
   helmet({
+    contentSecurityPolicy: false,
+    crossOriginEmbedderPolicy: false,
     crossOriginResourcePolicy: { policy: 'cross-origin' },
+    frameguard: { action: 'deny' },
+    hsts: { maxAge: 63_072_000, includeSubDomains: true, preload: true },
+    permittedCrossDomainPolicies: { permittedPolicies: 'none' },
+    referrerPolicy: { policy: 'no-referrer' },
   }),
 );
+app.use((_req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Pragma', 'no-cache');
+  next();
+});
 app.use(
   cors({
     origin: clientOrigins.length <= 1 ? clientOrigins[0] : clientOrigins,
@@ -34,6 +46,16 @@ app.use(
   }),
 );
 app.use(express.json({ limit: '1mb' }));
+app.use(
+  rateLimit({
+    windowMs: 60 * 1000,
+    max: 300,
+    standardHeaders: true,
+    legacyHeaders: false,
+    skip: (req) => req.method === 'OPTIONS' || req.path === '/' || req.path === '/api/health',
+    message: { error: 'Too many requests. Try again in a minute.' },
+  }),
+);
 
 let ready: Promise<void> | null = null;
 
